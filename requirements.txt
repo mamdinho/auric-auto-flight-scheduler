@@ -1,0 +1,8 @@
+# Web interface
+streamlit>=1.35
+
+# PDF parsing (passenger list ingestion)
+pdfplumber>=0.10
+
+# Production optimizer (heuristic fallback needs nothing beyond stdlib)
+ortools>=9.10,<10

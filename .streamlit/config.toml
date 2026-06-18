@@ -1,0 +1,6 @@
+[server]
+# Allow large passenger-list PDFs to be uploaded (default is 200 MB, set lower to save memory)
+maxUploadSize = 50
+
+[theme]
+base = "light"

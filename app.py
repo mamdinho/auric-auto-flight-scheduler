@@ -1,0 +1,783 @@
+"""
+app.py — Streamlit web interface for the Auric Air Flight Scheduler.
+
+Three tabs:
+  1. Build Manifest  — select flight(s) from the route master, upload PDFs,
+                       accumulate O-D demands into a single day's manifest.
+  2. Run Optimizer   — run OR-Tools / heuristic on the manifest; download outputs.
+  3. Manage Routes   — admin: add / edit the fixed route and leg timings for
+                       every flight number.
+
+Run locally:  streamlit run app.py
+Deploy:       push to GitHub, connect at streamlit.io/cloud
+"""
+
+import io
+import os
+import sys
+import tempfile
+
+import pandas as pd
+import streamlit as st
+
+here = os.path.dirname(os.path.abspath(__file__))
+if here not in sys.path:
+    sys.path.insert(0, here)
+
+import planner_core as pc
+import ingest
+
+
+# --------------------------------------------------------------------------- #
+# Solver helper
+# --------------------------------------------------------------------------- #
+
+def run_solver(strips, fleet, manifest, w, lm):
+    try:
+        from auric_route_planner import build_and_solve
+        result = build_and_solve(strips, fleet, manifest, w, lm, time_limit_s=15)
+        if result is not None:
+            return result[0], result[1], "OR-Tools"
+    except Exception:
+        pass
+    from demo_solver import solve
+    routes, dropped = solve(strips, fleet, manifest, w, lm)
+    return routes, dropped, "Heuristic"
+
+
+# --------------------------------------------------------------------------- #
+# Page config
+# --------------------------------------------------------------------------- #
+
+st.set_page_config(page_title="Auric Air Scheduler", page_icon="✈", layout="wide")
+st.title("Auric Air — Daily Flight Scheduler")
+
+# --------------------------------------------------------------------------- #
+# Sidebar — always-visible instructions
+# --------------------------------------------------------------------------- #
+
+with st.sidebar:
+    st.header("How to use this app")
+    st.markdown(
+        """
+There are **three tabs** at the top of the page:
+
+---
+
+### Tab 1 — Build Manifest *(daily)*
+Turn today's ops documents into an optimiser-ready manifest.
+
+1. **Upload Booking Analysis CSV** (once per day, optional — used to cross-check totals)
+2. **Select a flight** from the dropdown (routes are pre-configured in Tab 3)
+3. **Upload the passenger list PDF** for that flight
+4. Click **Add Flight to Manifest** — the O-D demand rows appear below
+5. Repeat steps 2-4 for every flight operating today
+6. Click **→ Run Optimizer** when all flights are added
+
+---
+
+### Tab 2 — Run Optimizer *(daily)*
+- Uses the manifest built in Tab 1, or upload your own `manifest.csv`
+- Click **Generate Schedule** to run OR-Tools (or heuristic fallback)
+- Download `schedule.csv` and `bookings.csv`
+
+---
+
+### Tab 3 — Manage Routes *(one-time setup per flight)*
+- Select an existing flight number or type a new one
+- Enter the stop sequence and published leg times (dep/arr HH:MM)
+- Click **Save Route** — the flight is now available in Tab 1
+
+---
+
+### Field reference
+
+| Field | Meaning |
+|---|---|
+| `open_min` | Minutes from midnight when the strip opens (390 = 06:30) |
+| `close_min` | Minutes from midnight when the strip closes (1110 = 18:30) |
+| `daylight_only` | 1 = bush strip, no night ops; 0 = lit runway, 24 hr |
+| `connect_by` | Arrival deadline(s) in minutes from midnight, semicolon-separated |
+| `earliest_dep` | Earliest departure from origin stop (set from leg timings) |
+| `Positioning` | Empty ferry leg — counts as wasted block time |
+
+**Bush-strip hours:** Sunrise ~06:30 (390 min), sunset ~18:30 (1110 min).
+Paved airports (ARK, JRO, DAR, ZNZ, MWZ) operate 24 hr (0 → 1440).
+
+---
+### Tips
+- **OR-Tools** gives better plans; the heuristic is a fast fallback.
+- If pax show as *UNSERVED*, check seat/payload capacity, daylight
+  windows, or duty limits in `fleet.csv`.
+- New airstrip codes must be added to `data/airstrips.csv`.
+        """
+    )
+
+# --------------------------------------------------------------------------- #
+# Load static reference data
+# --------------------------------------------------------------------------- #
+
+data_dir = os.path.join(here, "data")
+if not os.path.exists(f"{data_dir}/airstrips.csv") or not os.path.exists(f"{data_dir}/fleet.csv"):
+    st.error("airstrips.csv or fleet.csv not found in `data/`. Make sure both files are committed.")
+    st.stop()
+
+strips     = pc.load_airstrips(f"{data_dir}/airstrips.csv")
+known_codes = set(strips.keys())
+
+# --------------------------------------------------------------------------- #
+# Session-state initialisation
+# --------------------------------------------------------------------------- #
+
+if "manifest_rows" not in st.session_state:
+    st.session_state.manifest_rows = []      # accumulated O-D demand dicts
+if "manifest_date" not in st.session_state:
+    st.session_state.manifest_date = ""
+if "booking_counts" not in st.session_state:
+    st.session_state.booking_counts = {}     # {flight_num: pax} from booking CSV
+if "built_manifest" not in st.session_state:
+    st.session_state.built_manifest = None   # DataFrame sent to optimizer tab
+if "routes_action_radio" not in st.session_state:
+    st.session_state["routes_action_radio"] = "Edit existing flight"
+if "sched_result" not in st.session_state:
+    st.session_state["sched_result"] = None
+
+# --------------------------------------------------------------------------- #
+# Tabs
+# --------------------------------------------------------------------------- #
+
+tab_build, tab_optimize, tab_routes = st.tabs(
+    ["📋 Build Manifest", "✈ Run Optimizer", "🗺 Manage Routes"]
+)
+
+
+# =========================================================================== #
+# TAB 1 — Build Manifest
+# =========================================================================== #
+
+with tab_build:
+
+    routes_master = ingest.load_flight_routes()
+    configured_flights = sorted(routes_master.keys())
+
+    # ------------------------------------------------------------------ #
+    # Booking Analysis (once per day)
+    # ------------------------------------------------------------------ #
+    with st.expander("Upload Booking Analysis CSV (optional — used for pax cross-check)", expanded=False):
+        booking_file = st.file_uploader(
+            "Booking_Analysis.csv",
+            type=["csv"],
+            key="booking_csv",
+            help="One row per date, columns = flight numbers (UI001…)",
+        )
+        if booking_file:
+            try:
+                bdate, bcounts = ingest.parse_booking_analysis(booking_file)
+                st.session_state.booking_counts = bcounts
+                if not st.session_state.manifest_date and bdate:
+                    st.session_state.manifest_date = bdate
+                st.success(
+                    f"Booking Analysis loaded: {bdate} — "
+                    f"{len(bcounts)} flights with pax booked"
+                )
+            except Exception as e:
+                st.error(f"Booking Analysis error: {e}")
+
+    st.divider()
+
+    # ------------------------------------------------------------------ #
+    # Add one flight at a time
+    # ------------------------------------------------------------------ #
+    st.subheader("Add a flight to today's manifest")
+
+    if not configured_flights:
+        st.warning(
+            "No flight routes are configured yet. "
+            "Go to the **Manage Routes** tab to add your flight numbers and stop sequences."
+        )
+    else:
+        col_sel, col_prev = st.columns([1, 2])
+
+        with col_sel:
+            selected_flight = st.selectbox(
+                "Select flight number",
+                configured_flights,
+                help="Routes are configured in the Manage Routes tab",
+            )
+            _ac_type = ingest.route_aircraft_type(routes_master, selected_flight)
+            if _ac_type and _ac_type in ingest.AIRCRAFT_TYPE_OPTS:
+                _info = ingest.AIRCRAFT_TYPE_OPTS[_ac_type]
+                st.caption(f"Aircraft: **{_info['name']}**  ·  {_info['seats']} seats")
+
+        with col_prev:
+            stops = ingest.route_stop_sequence(routes_master, selected_flight)
+            if stops:
+                legs = routes_master[selected_flight]
+                st.markdown(f"**{selected_flight} route** ({len(legs)} legs)")
+                stop_line = " → ".join(stops)
+                st.code(stop_line, language=None)
+                if legs and legs[0].get("dep"):
+                    first_dep = legs[0]["dep"]
+                    last_arr  = legs[-1].get("arr", "?")
+                    st.caption(f"Scheduled: {first_dep} → {last_arr}")
+            else:
+                st.caption("No legs configured for this flight yet — add them in Manage Routes.")
+
+        # PDF upload for this flight
+        pax_file = st.file_uploader(
+            f"Passenger list PDF for {selected_flight}",
+            type=["pdf"],
+            key=f"pdf_{selected_flight}",
+            help="Standard Auric Air passenger list — section headers like 'GTZ - ARK'",
+        )
+
+        if pax_file and st.button(
+            f"Add {selected_flight} to Manifest", type="primary", key="btn_add_flight"
+        ):
+            pdf_bytes = pax_file.read()
+
+            # Show raw text in expander for debugging
+            raw_lines = ingest.extract_pdf_text(io.BytesIO(pdf_bytes))
+            with st.expander("Raw text extracted from PDF (expand to debug format issues)", expanded=False):
+                st.code("\n".join(raw_lines), language=None)
+
+            # Parse PDF
+            flight_num, pdf_date, od_list = ingest.parse_passenger_pdf(io.BytesIO(pdf_bytes))
+
+            if not od_list:
+                st.error(
+                    "Could not find any O-D demand groups in the PDF. "
+                    "Open the raw text expander above and check that section headers "
+                    "appear as standalone lines like `GTZ - ARK`."
+                )
+            else:
+                # Resolve date
+                day = pdf_date or st.session_state.manifest_date or "unknown"
+                if not st.session_state.manifest_date and day != "unknown":
+                    st.session_state.manifest_date = day
+
+                # Use master route timings for this flight
+                timings = ingest.routes_to_timings(routes_master, [selected_flight])
+
+                # Build manifest rows
+                df_new = ingest.build_manifest(od_list, timings, day, selected_flight)
+
+                # Pax cross-check against booking analysis
+                bc = st.session_state.booking_counts
+                fn  = flight_num or selected_flight
+                manifest_pax = df_new["pax"].sum()
+                if fn in bc:
+                    if bc[fn] != manifest_pax:
+                        st.warning(
+                            f"Pax mismatch for {fn}: Booking Analysis = {bc[fn]}, "
+                            f"PDF total = {manifest_pax}. Check the passenger list."
+                        )
+                    else:
+                        st.info(f"Pax cross-check OK: {manifest_pax} pax matches Booking Analysis.")
+
+                # Warn on unknown airstrip codes
+                all_codes = set(df_new["origin"]) | set(df_new["dest"])
+                unknown = all_codes - known_codes
+                if unknown:
+                    st.warning(
+                        f"Unknown airstrip codes (add to airstrips.csv before running optimiser): "
+                        f"**{', '.join(sorted(unknown))}**"
+                    )
+
+                # Append to accumulated manifest
+                st.session_state.manifest_rows.extend(df_new.to_dict("records"))
+
+                st.success(
+                    f"Added {selected_flight}: {len(od_list)} O-D groups, "
+                    f"{manifest_pax} pax — manifest now has "
+                    f"{len(st.session_state.manifest_rows)} total rows."
+                )
+
+                # Save PDF to disk so it stays accessible for the day
+                _plist_dir = os.path.join(here, "data", "passenger_lists")
+                os.makedirs(_plist_dir, exist_ok=True)
+                _safe_date = (day or "unknown").replace("/", "-").replace("\\", "-")
+                _fn_key    = (flight_num or selected_flight).replace("/", "-")
+                _pdf_path  = os.path.join(_plist_dir, f"{_safe_date}_{_fn_key}.pdf")
+                with open(_pdf_path, "wb") as _pdf_fh:
+                    _pdf_fh.write(pdf_bytes)
+                st.caption(f"Passenger list saved: {os.path.basename(_pdf_path)}")
+
+    # ------------------------------------------------------------------ #
+    # Today's accumulated manifest
+    # ------------------------------------------------------------------ #
+    st.divider()
+    st.subheader("Today's manifest")
+
+    rows = st.session_state.manifest_rows
+    if not rows:
+        st.info("No flights added yet. Select a flight above and upload its PDF.")
+    else:
+        df_manifest = pd.DataFrame(rows)
+        st.dataframe(df_manifest, use_container_width=True, hide_index=True)
+        st.caption(
+            f"{len(rows)} demand rows · "
+            f"{df_manifest['pax'].sum()} total pax · "
+            f"date: {st.session_state.manifest_date or 'unknown'}"
+        )
+
+        btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 2])
+
+        with btn_col1:
+            if st.button("🗑 Clear all flights", key="btn_clear"):
+                st.session_state.manifest_rows = []
+                st.session_state.manifest_date = ""
+                st.rerun()
+
+        with btn_col2:
+            st.download_button(
+                "⬇ Download manifest.csv",
+                df_manifest.to_csv(index=False).encode(),
+                file_name="manifest.csv",
+                mime="text/csv",
+            )
+
+        with btn_col3:
+            if st.button("✈ Send to Optimizer →", type="primary", key="btn_send"):
+                st.session_state.built_manifest = df_manifest.copy()
+                st.session_state["sched_result"] = None  # clear any previous schedule
+                st.success("Manifest sent. Switch to the **Run Optimizer** tab above.")
+
+    # ------------------------------------------------------------------ #
+    # Saved Passenger Lists
+    # ------------------------------------------------------------------ #
+    st.divider()
+    st.subheader("Saved Passenger Lists")
+    _plist_dir = os.path.join(here, "data", "passenger_lists")
+    _saved = sorted(
+        [f for f in os.listdir(_plist_dir) if f.endswith(".pdf")]
+    ) if os.path.exists(_plist_dir) else []
+
+    if not _saved:
+        st.info("No passenger lists saved yet — upload a PDF above to create a record.")
+    else:
+        st.caption(
+            "These PDFs are stored in `data/passenger_lists/`. "
+            "To replace a file, re-upload the corrected PDF for the same flight in the section above."
+        )
+        _hdr = st.columns([3, 1, 1])
+        _hdr[0].markdown("**File**")
+        _hdr[1].markdown("**Size**")
+        _hdr[2].markdown("**Download**")
+        for _fname in _saved:
+            _fpath = os.path.join(_plist_dir, _fname)
+            _fsize = os.path.getsize(_fpath)
+            _col_name, _col_size, _col_dl = st.columns([3, 1, 1])
+            _col_name.write(f"📄 {_fname}")
+            _col_size.write(f"{_fsize // 1024} KB" if _fsize >= 1024 else f"{_fsize} B")
+            with open(_fpath, "rb") as _fh:
+                _col_dl.download_button(
+                    "⬇",
+                    _fh.read(),
+                    file_name=_fname,
+                    mime="application/pdf",
+                    key=f"dl_plist_{_fname}",
+                )
+
+
+# =========================================================================== #
+# TAB 2 — Run Optimizer
+# =========================================================================== #
+
+with tab_optimize:
+    st.subheader("Generate schedule from manifest")
+
+    prefilled = st.session_state.get("built_manifest")
+    if prefilled is not None:
+        st.info("Using the manifest built in the Build Manifest tab.")
+
+    uploaded = st.file_uploader(
+        "Or upload manifest.csv directly",
+        type=["csv"],
+        key="manifest_upload",
+        help="Columns: id, date, origin, dest, pax, connect_by (opt), earliest_dep (opt)",
+    )
+
+    df_manifest = None
+    if uploaded:
+        df_manifest = pd.read_csv(uploaded)
+    elif prefilled is not None:
+        df_manifest = prefilled
+    else:
+        st.info("Build a manifest in the Build Manifest tab, or upload one here.")
+
+    if df_manifest is not None:
+
+        with st.expander("Manifest preview", expanded=True):
+            st.dataframe(df_manifest, use_container_width=True, hide_index=True)
+
+        if st.button("Generate Schedule", type="primary", key="btn_optimize"):
+
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="") as f:
+                df_manifest.to_csv(f, index=False)
+                manifest_path = f.name
+
+            _load_ok = True
+            try:
+                fleet    = pc.load_fleet(f"{data_dir}/fleet.csv")
+                manifest = pc.load_manifest(manifest_path)
+            except Exception as e:
+                st.error(f"Could not load data: {e}")
+                _load_ok = False
+            finally:
+                try:
+                    os.unlink(manifest_path)
+                except OSError:
+                    pass
+
+            if _load_ok:
+                demands = {d.id: d for d in manifest}
+                w, lm   = pc.Weights(), pc.LoadModel()
+
+                with st.spinner("Optimising routes…"):
+                    routes, dropped, engine = run_solver(strips, fleet, manifest, w, lm)
+
+                total_pax   = sum(d.pax for d in demands.values())
+                served_pax  = total_pax - sum(d.pax for d in dropped)
+                ac_used     = sum(1 for _, (_, _, res) in routes.items() if res.used)
+                total_block = sum(res.total_block_min for _, _, res in routes.values())
+                empty_block = sum(res.empty_block_min for _, _, res in routes.values())
+
+                sched_rows = []
+                for reg, (ac, stops_seq, res) in routes.items():
+                    if not res.used:
+                        continue
+
+                    # Aggregate per-location pax events for this aircraft so
+                    # each leg's destination row can show what happens there.
+                    _loc_ev: dict[str, dict[str, int]] = {}
+                    for _s in stops_seq:
+                        if _s.kind not in ("pickup", "delivery"):
+                            continue
+                        _d = demands[_s.demand_id]
+                        _ev = _loc_ev.setdefault(_s.code, {"dropped": 0, "picked": 0})
+                        if _s.kind == "pickup":
+                            _ev["picked"] += _d.pax
+                        else:
+                            _ev["dropped"] += _d.pax
+
+                    leg_no = 0
+                    for lg in res.legs:
+                        if lg.block_min == 0:
+                            continue
+                        leg_no += 1
+                        _to_ev = _loc_ev.get(lg.to, {"dropped": 0, "picked": 0})
+
+                        if lg.empty:
+                            if _to_ev["picked"] > 0:
+                                _pos = f"Pickup at {lg.to}"
+                            elif lg.to == ac.base:
+                                _pos = "Return to base"
+                            else:
+                                _pos = "Positioning"
+                        else:
+                            _pos = ""
+
+                        sched_rows.append({
+                            "Aircraft":    reg,
+                            "Leg":         leg_no,
+                            "Depart":      pc.hhmm(lg.depart_min),
+                            "Arrive":      pc.hhmm(lg.arrive_min),
+                            "From":        f"{lg.frm}  {strips[lg.frm].name if lg.frm in strips else ''}",
+                            "To":          f"{lg.to}  {strips[lg.to].name if lg.to in strips else ''}",
+                            "Pax on Leg":  lg.pax_onboard,
+                            "Dropped":     _to_ev["dropped"],
+                            "Picked Up":   _to_ev["picked"],
+                            "Block (min)": int(lg.block_min),
+                            "Positioning": _pos,
+                        })
+
+                booking_rows = []
+                for reg, (ac, stops_seq, _) in routes.items():
+                    for s in stops_seq:
+                        if s.kind != "pickup":
+                            continue
+                        d  = demands[s.demand_id]
+                        cb = " / ".join(pc.hhmm(t) for t in d.connect_by) if d.connect_by else ""
+                        booking_rows.append({
+                            "Booking ID": d.id,
+                            "Pax":        d.pax,
+                            "From":       f"{d.origin}  {strips[d.origin].name if d.origin in strips else ''}",
+                            "To":         f"{d.dest}  {strips[d.dest].name if d.dest in strips else ''}",
+                            "Aircraft":   reg,
+                            "Connect By": cb,
+                            "Passengers": " | ".join(d.passengers) if d.passengers else "",
+                            "Status":     "Served",
+                        })
+                for d in dropped:
+                    cb = " / ".join(pc.hhmm(t) for t in d.connect_by) if d.connect_by else ""
+                    booking_rows.append({
+                        "Booking ID": d.id,
+                        "Pax":        d.pax,
+                        "From":       f"{d.origin}  {strips[d.origin].name if d.origin in strips else ''}",
+                        "To":         f"{d.dest}  {strips[d.dest].name if d.dest in strips else ''}",
+                        "Aircraft":   "UNSERVED",
+                        "Connect By": cb,
+                        "Passengers": " | ".join(d.passengers) if d.passengers else "",
+                        "Status":     "UNSERVED — handle manually",
+                    })
+
+                df_sched    = pd.DataFrame(sched_rows)
+                df_bookings = pd.DataFrame(booking_rows).sort_values(["Aircraft", "Booking ID"])
+
+                # Store in session state so results survive download-button reruns
+                st.session_state["sched_result"] = {
+                    "engine":        engine,
+                    "served_pax":    served_pax,
+                    "total_pax":     total_pax,
+                    "ac_used":       ac_used,
+                    "total_block":   int(total_block),
+                    "empty_block":   int(empty_block),
+                    "dropped_pax":   sum(d.pax for d in dropped),
+                    "dropped_items": [
+                        f"{d.id}: {d.origin} → {d.dest}, {d.pax} pax"
+                        for d in dropped
+                    ],
+                    "df_sched":    df_sched,
+                    "df_bookings": df_bookings,
+                }
+
+        # ---- Persistent results display (survives download-button reruns) ----
+        sr = st.session_state.get("sched_result")
+        if sr is not None:
+            st.success(f"Schedule generated using the **{sr['engine']}** engine.")
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Pax Served",           f"{sr['served_pax']} / {sr['total_pax']}")
+            c2.metric("Aircraft Used",         sr["ac_used"])
+            c3.metric("Total Block Time",      f"{sr['total_block']} min")
+            c4.metric(
+                "Positioning (empty) Time",
+                f"{sr['empty_block']} min",
+                delta=f"-{sr['empty_block']} min wasted" if sr["empty_block"] else "0 min",
+                delta_color="inverse" if sr["empty_block"] else "off",
+            )
+
+            if sr["dropped_items"]:
+                st.warning(
+                    f"{sr['dropped_pax']} pax on {len(sr['dropped_items'])} booking(s) "
+                    "could not be served — check capacity, daylight windows, or duty limits."
+                )
+                for msg in sr["dropped_items"]:
+                    st.write(f"  • {msg}")
+
+            t1, t2 = st.tabs(["Flight Schedule", "Bookings"])
+            with t1:
+                st.dataframe(sr["df_sched"], use_container_width=True, hide_index=True)
+            with t2:
+                st.dataframe(sr["df_bookings"], use_container_width=True, hide_index=True)
+
+            st.divider()
+            dl1, dl2, dl3 = st.columns([2, 2, 1])
+            dl1.download_button(
+                "⬇ Download schedule.csv",
+                sr["df_sched"].to_csv(index=False).encode(),
+                file_name="schedule.csv",
+                mime="text/csv",
+                key="dl_sched",
+            )
+            dl2.download_button(
+                "⬇ Download bookings.csv",
+                sr["df_bookings"].to_csv(index=False).encode(),
+                file_name="bookings.csv",
+                mime="text/csv",
+                key="dl_bookings",
+            )
+            with dl3:
+                if st.button("🗑 Clear", key="btn_clear_sched",
+                             help="Remove results to start a fresh run"):
+                    st.session_state["sched_result"] = None
+                    st.rerun()
+
+
+# =========================================================================== #
+# TAB 3 — Manage Routes
+# =========================================================================== #
+
+with tab_routes:
+    st.subheader("Flight Route Master")
+    st.caption(
+        "Configure the fixed stop sequence and published leg times for each flight number. "
+        "This is a one-time setup — routes are reused every day until the schedule changes."
+    )
+
+    routes_master_edit = ingest.load_flight_routes()
+    configured = sorted(routes_master_edit.keys())
+
+    col_left, col_right = st.columns([1, 2])
+
+    with col_left:
+        st.markdown("**Select or create a flight**")
+
+        action = st.radio(
+            "Action",
+            ["Edit existing flight", "Add new flight"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="routes_action_radio",
+        )
+
+        if action == "Edit existing flight":
+            if not configured:
+                st.info("No flights configured yet. Choose 'Add new flight'.")
+                edit_flight = None
+            else:
+                edit_flight = st.selectbox("Flight number", configured, key="sel_edit_flight")
+        else:
+            raw = st.text_input(
+                "New flight number (3–6 uppercase letters/digits)",
+                placeholder="e.g. UI001",
+                key="new_flight_input_box",
+            ).strip().upper()
+            edit_flight = raw if raw else None
+            if raw and raw in configured:
+                st.warning(f"{raw} already exists — switch to 'Edit existing flight' to modify it.")
+
+        if edit_flight:
+            st.divider()
+            st.markdown(f"**Route summary for {edit_flight}**")
+            stops = ingest.route_stop_sequence(routes_master_edit, edit_flight)
+            if stops:
+                st.code(" → ".join(stops), language=None)
+                legs_ex = routes_master_edit.get(edit_flight, [])
+                if legs_ex and legs_ex[0].get("dep"):
+                    st.caption(
+                        f"{legs_ex[0]['dep']} dep  ·  "
+                        f"{legs_ex[-1].get('arr', '?')} arr  ·  "
+                        f"{len(legs_ex)} legs"
+                    )
+            else:
+                st.caption("No legs yet — add them in the table.")
+
+            # Delete flight button
+            if edit_flight in routes_master_edit:
+                if st.button(f"🗑 Delete {edit_flight}", key="btn_del_flight"):
+                    del routes_master_edit[edit_flight]
+                    ingest.save_flight_routes(routes_master_edit)
+                    st.success(f"{edit_flight} deleted.")
+                    st.rerun()
+
+    with col_right:
+        if edit_flight:
+            st.markdown(f"**Legs for {edit_flight}** — edit cells, add or delete rows, then save")
+
+            # Aircraft type selector
+            _type_keys = list(ingest.AIRCRAFT_TYPE_OPTS.keys())
+            _curr_type = ingest.route_aircraft_type(routes_master_edit, edit_flight)
+            _type_idx  = _type_keys.index(_curr_type) if _curr_type in _type_keys else 0
+            sel_ac_type = st.selectbox(
+                "Scheduled aircraft type",
+                _type_keys,
+                index=_type_idx,
+                format_func=lambda k: (
+                    f"{ingest.AIRCRAFT_TYPE_OPTS[k]['name']}  ·  "
+                    f"{ingest.AIRCRAFT_TYPE_OPTS[k]['seats']} seats"
+                ),
+                key=f"actype_{edit_flight}",
+                help="Aircraft type that operates this flight — used for capacity display",
+            )
+
+            existing_legs = routes_master_edit.get(edit_flight, [])
+            df_legs = pd.DataFrame(
+                [{"from": l["from"], "to": l["to"], "dep": l["dep"], "arr": l["arr"]}
+                 for l in existing_legs]
+                if existing_legs
+                else [{"from": "", "to": "", "dep": "", "arr": ""}]
+            )
+
+            edited = st.data_editor(
+                df_legs,
+                column_config={
+                    "from": st.column_config.TextColumn("From", width="small",
+                        help="3-letter airstrip code, e.g. SEU"),
+                    "to":   st.column_config.TextColumn("To",   width="small",
+                        help="3-letter airstrip code, e.g. ZNZ"),
+                    "dep":  st.column_config.TextColumn("Depart (HH:MM)", width="small",
+                        help="Published departure time, e.g. 10:00"),
+                    "arr":  st.column_config.TextColumn("Arrive (HH:MM)", width="small",
+                        help="Published arrival time, e.g. 11:20"),
+                },
+                num_rows="dynamic",
+                use_container_width=True,
+                hide_index=True,
+                key=f"editor_{edit_flight}",
+            )
+
+            if st.button("💾 Save Route", type="primary", key="btn_save_route"):
+                new_legs = []
+                for _, row in edited.iterrows():
+                    frm = str(row.get("from") or "").strip().upper()
+                    to  = str(row.get("to")   or "").strip().upper()
+                    if frm and to:
+                        new_legs.append({
+                            "from": frm,
+                            "to":   to,
+                            "dep":  str(row.get("dep") or "").strip(),
+                            "arr":  str(row.get("arr") or "").strip(),
+                            "aircraft_type": sel_ac_type,
+                        })
+
+                if not new_legs:
+                    st.error("No valid legs to save — each row needs at least a From and To code.")
+                else:
+                    # Validate airstrip codes
+                    all_codes_in_route = {l["from"] for l in new_legs} | {l["to"] for l in new_legs}
+                    unknown = all_codes_in_route - known_codes
+                    if unknown:
+                        st.warning(
+                            f"These codes are not in airstrips.csv — add them before running "
+                            f"the optimiser: **{', '.join(sorted(unknown))}**"
+                        )
+
+                    routes_master_edit[edit_flight] = new_legs
+                    ingest.save_flight_routes(routes_master_edit)
+                    st.success(
+                        f"Route for **{edit_flight}** saved — "
+                        f"{len(new_legs)} legs · "
+                        f"{ingest.AIRCRAFT_TYPE_OPTS.get(sel_ac_type, {}).get('name', sel_ac_type)} · "
+                        f"{' → '.join(ingest.route_stop_sequence(routes_master_edit, edit_flight))}"
+                    )
+                    # Reset form: switch back to Edit mode, pre-select the just-saved flight
+                    st.session_state["routes_action_radio"] = "Edit existing flight"
+                    st.session_state["new_flight_input_box"] = ""
+                    st.session_state["sel_edit_flight"] = edit_flight
+                    st.rerun()
+        else:
+            st.info("Select or create a flight on the left to edit its route.")
+
+    # ---- All configured routes at a glance --------------------------------
+    st.divider()
+    st.markdown("**All configured flights**")
+    if not routes_master_edit:
+        st.info("No flights configured yet.")
+    else:
+        summary_rows = []
+        for fn in sorted(routes_master_edit):
+            legs  = routes_master_edit[fn]
+            stops = ingest.route_stop_sequence(routes_master_edit, fn)
+            ac    = ingest.route_aircraft_type(routes_master_edit, fn)
+            ac_display = (
+                ingest.AIRCRAFT_TYPE_OPTS[ac]["name"]
+                if ac in ingest.AIRCRAFT_TYPE_OPTS else (ac or "—")
+            )
+            summary_rows.append({
+                "Flight":   fn,
+                "Aircraft": ac_display,
+                "Seats":    ingest.AIRCRAFT_TYPE_OPTS.get(ac, {}).get("seats", "—"),
+                "Legs":     len(legs),
+                "From":     stops[0]  if stops else "",
+                "To":       stops[-1] if stops else "",
+                "Dep":      legs[0].get("dep", "") if legs else "",
+                "Arr":      legs[-1].get("arr", "") if legs else "",
+                "Route":    " → ".join(stops),
+            })
+        st.dataframe(
+            pd.DataFrame(summary_rows),
+            use_container_width=True,
+            hide_index=True,
+        )

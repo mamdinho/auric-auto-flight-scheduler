@@ -1,0 +1,27 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── Daily operational outputs (generated at runtime, never source code) ───────
+output/
+
+# ── Sensitive / ephemeral operational data ────────────────────────────────────
+# Passenger lists contain real passenger names — do NOT commit to GitHub.
+data/passenger_lists/
+
+# Daily manifest is rebuilt from PDFs each morning; no need to track it.
+data/manifest.csv
+
+# ── OS noise ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
