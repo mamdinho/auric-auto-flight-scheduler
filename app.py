@@ -291,7 +291,7 @@ with tab_build:
                     ),
                 },
                 num_rows="fixed",
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
                 key=f"ac_editor_{selected_flight}_{_ac_count}",
             )
@@ -420,7 +420,7 @@ with tab_build:
         df_manifest = pd.DataFrame(rows)
         # Show table without internal tracking column
         _display_cols = [c for c in df_manifest.columns if c != "_src_flight"]
-        st.dataframe(df_manifest[_display_cols], use_container_width=True, hide_index=True)
+        st.dataframe(df_manifest[_display_cols], width='stretch', hide_index=True)
         st.caption(
             f"{len(rows)} demand rows · "
             f"{df_manifest['pax'].sum()} total pax · "
@@ -548,7 +548,7 @@ with tab_optimize:
     if df_manifest is not None:
 
         with st.expander("Manifest preview", expanded=True):
-            st.dataframe(df_manifest, use_container_width=True, hide_index=True)
+            st.dataframe(df_manifest, width='stretch', hide_index=True)
 
         if st.button("Generate Schedule", type="primary", key="btn_optimize"):
 
@@ -738,9 +738,9 @@ with tab_optimize:
 
             t1, t2 = st.tabs(["Flight Schedule", "Bookings"])
             with t1:
-                st.dataframe(sr["df_sched"], use_container_width=True, hide_index=True)
+                st.dataframe(sr["df_sched"], width='stretch', hide_index=True)
             with t2:
-                st.dataframe(sr["df_bookings"], use_container_width=True, hide_index=True)
+                st.dataframe(sr["df_bookings"], width='stretch', hide_index=True)
 
             st.divider()
             dl1, dl2, dl3 = st.columns([2, 2, 1])
@@ -873,7 +873,7 @@ with tab_routes:
                         help="Published arrival time, e.g. 11:20"),
                 },
                 num_rows="dynamic",
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
                 key=f"editor_{edit_flight}",
             )
@@ -948,6 +948,6 @@ with tab_routes:
             })
         st.dataframe(
             pd.DataFrame(summary_rows),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
