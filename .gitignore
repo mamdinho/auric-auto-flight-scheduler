@@ -16,6 +16,9 @@ data/passenger_lists/
 # Daily manifest is rebuilt from PDFs each morning; no need to track it.
 data/manifest.csv
 
+# Per-day aircraft assignments — operational data, not source code.
+data/flight_aircraft/
+
 # ── OS noise ──────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db

@@ -10,6 +10,7 @@ Accepted inputs
 Output: a manifest DataFrame ready for the route optimiser.
 """
 from __future__ import annotations
+import json
 import os
 import re
 from datetime import datetime
@@ -17,6 +18,7 @@ import pandas as pd
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 ROUTES_CSV = os.path.join(_HERE, "data", "flight_routes.csv")
+FLIGHT_AIRCRAFT_DIR = os.path.join(_HERE, "data", "flight_aircraft")
 
 # Airstrip code aliases — maps names used in passenger PDFs to the internal
 # code used in airstrips.csv and flight_routes.csv.
@@ -40,12 +42,35 @@ def _resolve_aliases(od_list: list[dict]) -> list[dict]:
 
 # Aircraft type catalogue — keys match fleet.csv `type` column and
 # flight_routes.csv `aircraft_type` column.
+# Specs are planning defaults; fleet.csv overrides for individually configured aircraft.
 AIRCRAFT_TYPE_OPTS: dict[str, dict] = {
-    "C208B":    {"name": "Caravan (C208B)",    "seats": 13},
-    "DHC8-100": {"name": "Dash-8 Series 100",  "seats": 37},
-    "DHC8-200": {"name": "Dash-8 Series 200",  "seats": 39},
-    "DHC8-300": {"name": "Dash-8 Series 300",  "seats": 50},
-    "PC12":     {"name": "PC-12",              "seats": 8},
+    # payload_kg must cover seats × 99 kg/pax (84 kg pax + 15 kg bag) so the
+    # seat count is always the binding capacity constraint, not weight.
+    "C208B": {
+        "name": "Caravan (C208B)", "seats": 12,
+        "payload_kg": 1200, "cruise_kts": 160,
+        "turnaround_min": 20, "max_duty_min": 600, "available_until": 1110,
+    },
+    "DHC8-100": {
+        "name": "Dash-8 Series 100", "seats": 37,
+        "payload_kg": 3700, "cruise_kts": 265,
+        "turnaround_min": 25, "max_duty_min": 600, "available_until": 1110,
+    },
+    "DHC8-200": {
+        "name": "Dash-8 Series 200", "seats": 39,
+        "payload_kg": 3900, "cruise_kts": 265,
+        "turnaround_min": 25, "max_duty_min": 600, "available_until": 1110,
+    },
+    "DHC8-300": {
+        "name": "Dash-8 Series 300", "seats": 50,
+        "payload_kg": 5000, "cruise_kts": 285,
+        "turnaround_min": 30, "max_duty_min": 600, "available_until": 1110,
+    },
+    "PC12": {
+        "name": "PC-12", "seats": 8,
+        "payload_kg": 1100, "cruise_kts": 275,
+        "turnaround_min": 15, "max_duty_min": 600, "available_until": 1110,
+    },
 }
 
 
@@ -475,6 +500,109 @@ def route_aircraft_type(routes: dict[str, list[dict]], flight_num: str) -> str:
     """Return the aircraft_type code for a flight, or '' if not set."""
     legs = routes.get(flight_num, [])
     return legs[0].get("aircraft_type", "") if legs else ""
+
+
+# --------------------------------------------------------------------------- #
+# Per-day aircraft assignments  (saved in data/flight_aircraft/)
+# --------------------------------------------------------------------------- #
+
+def save_flight_aircraft(
+    date: str,
+    flight_num: str,
+    aircraft_list: list[dict],
+    base_dir: str = FLIGHT_AIRCRAFT_DIR,
+) -> str:
+    """Persist the aircraft assigned to one flight on one day.
+
+    aircraft_list is a list of {"type": "C208B", "reg": "5H-AUB"} dicts.
+    Returns the path written.
+    """
+    os.makedirs(base_dir, exist_ok=True)
+    safe = date.replace("/", "-").replace("\\", "-")
+    fn   = flight_num.replace("/", "-")
+    path = os.path.join(base_dir, f"{safe}_{fn}_aircraft.json")
+    with open(path, "w") as f:
+        json.dump({"date": date, "flight": flight_num, "aircraft": aircraft_list}, f, indent=2)
+    return path
+
+
+def load_flight_aircraft(
+    date: str,
+    flight_num: str,
+    base_dir: str = FLIGHT_AIRCRAFT_DIR,
+) -> list[dict]:
+    """Load the aircraft list for one flight on one day. Returns [] if not found."""
+    safe = date.replace("/", "-").replace("\\", "-")
+    fn   = flight_num.replace("/", "-")
+    path = os.path.join(base_dir, f"{safe}_{fn}_aircraft.json")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        data = json.load(f)
+    return data.get("aircraft", [])
+
+
+def load_all_day_aircraft(
+    date: str,
+    base_dir: str = FLIGHT_AIRCRAFT_DIR,
+) -> dict[str, list[dict]]:
+    """Load ALL aircraft assignments for a given date.
+
+    Returns {flight_num: [{type, reg}, ...]}
+    """
+    if not os.path.exists(base_dir):
+        return {}
+    safe   = date.replace("/", "-").replace("\\", "-")
+    result: dict[str, list[dict]] = {}
+    for fname in os.listdir(base_dir):
+        if fname.startswith(safe) and fname.endswith("_aircraft.json"):
+            with open(os.path.join(base_dir, fname)) as f:
+                data = json.load(f)
+            result[data["flight"]] = data.get("aircraft", [])
+    return result
+
+
+def build_fleet_specs(
+    all_assignments: dict[str, list[dict]],
+    routes_master: dict[str, list[dict]],
+) -> list[dict]:
+    """Convert per-day aircraft assignments into a list of aircraft spec dicts.
+
+    Each dict has the same fields as a fleet.csv row so app.py can build
+    pc.Aircraft objects directly.  Assignments without a matching route are
+    skipped.  Duplicate registrations across flights are deduplicated.
+    """
+    specs: list[dict] = []
+    seen_regs: set[str] = set()
+
+    for flight_num, aircraft_list in all_assignments.items():
+        legs = routes_master.get(flight_num, [])
+        if not legs:
+            continue
+        base_airport = legs[0]["from"]
+        first_dep    = _hhmm_to_min(legs[0].get("dep", "06:00")) or 360
+
+        for i, ac_spec in enumerate(aircraft_list):
+            ac_type = ac_spec.get("type", "C208B")
+            reg     = (ac_spec.get("reg") or "").strip() or f"{flight_num}-{ac_type}-{i + 1}"
+            if reg in seen_regs:
+                continue
+            seen_regs.add(reg)
+            s = AIRCRAFT_TYPE_OPTS.get(ac_type, AIRCRAFT_TYPE_OPTS["C208B"])
+            specs.append({
+                "reg":            reg,
+                "type":           ac_type,
+                "base":           base_airport,
+                "seats":          s["seats"],
+                "payload_kg":     s["payload_kg"],
+                "cruise_kts":     s["cruise_kts"],
+                "available_from": first_dep,
+                "available_until": s["available_until"],
+                "max_duty_min":   s["max_duty_min"],
+                "turnaround_min": s["turnaround_min"],
+            })
+
+    return specs
 
 
 # --------------------------------------------------------------------------- #

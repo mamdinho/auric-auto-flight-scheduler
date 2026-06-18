@@ -29,8 +29,35 @@ import ingest
 
 
 # --------------------------------------------------------------------------- #
-# Solver helper
+# Helpers
 # --------------------------------------------------------------------------- #
+
+def _split_large_demands(manifest: list, max_seats: int) -> list:
+    """Split any demand with pax > max_seats into sub-demands that each fit."""
+    result = []
+    for d in manifest:
+        if d.pax <= max_seats:
+            result.append(d)
+            continue
+        pax_names = list(d.passengers) if d.passengers else []
+        remaining, part = d.pax, 1
+        while remaining > 0:
+            cpax = min(remaining, max_seats)
+            result.append(pc.Demand(
+                id=f"{d.id}-p{part}",
+                date=d.date,
+                origin=d.origin,
+                dest=d.dest,
+                pax=cpax,
+                connect_by=d.connect_by,
+                earliest_dep=d.earliest_dep,
+                passengers=pax_names[:cpax] if pax_names else None,
+            ))
+            pax_names = pax_names[cpax:]
+            remaining -= cpax
+            part += 1
+    return result
+
 
 def run_solver(strips, fleet, manifest, w, lm):
     try:
@@ -141,6 +168,8 @@ if "routes_action_radio" not in st.session_state:
     st.session_state["routes_action_radio"] = "Edit existing flight"
 if "sched_result" not in st.session_state:
     st.session_state["sched_result"] = None
+if "day_aircraft" not in st.session_state:
+    st.session_state["day_aircraft"] = {}   # {flight_num: [{type, reg}, ...]}
 
 # --------------------------------------------------------------------------- #
 # Tabs
@@ -223,6 +252,73 @@ with tab_build:
             else:
                 st.caption("No legs configured for this flight yet — add them in Manage Routes.")
 
+        # Aircraft assignment for this flight today
+        _save_day = st.session_state.manifest_date or "unknown"
+        _saved_ac = ingest.load_flight_aircraft(_save_day, selected_flight)
+        _default_type = ingest.route_aircraft_type(routes_master, selected_flight) or "C208B"
+        _type_keys = list(ingest.AIRCRAFT_TYPE_OPTS.keys())
+
+        with st.expander(
+            f"Aircraft available today for {selected_flight} (required for capacity planning)",
+            expanded=not _saved_ac,
+        ):
+            _ac_count = st.number_input(
+                "Number of aircraft assigned to this flight today",
+                min_value=1, max_value=10,
+                value=max(len(_saved_ac), 1),
+                key=f"ac_count_{selected_flight}",
+                help="How many aircraft will operate this flight today?",
+            )
+
+            _ac_rows = []
+            for _i in range(_ac_count):
+                if _i < len(_saved_ac):
+                    _ac_rows.append({"type": _saved_ac[_i].get("type", _default_type),
+                                     "reg":  _saved_ac[_i].get("reg", "")})
+                else:
+                    _ac_rows.append({"type": _default_type, "reg": ""})
+
+            _edited_ac = st.data_editor(
+                pd.DataFrame(_ac_rows),
+                column_config={
+                    "type": st.column_config.SelectboxColumn(
+                        "Type", options=_type_keys, required=True,
+                        help="C208B = Caravan (12 pax max), DHC8-* = Dash-8, PC12",
+                    ),
+                    "reg": st.column_config.TextColumn(
+                        "Registration (optional)",
+                        help="e.g. 5H-AUB — leave blank to auto-assign",
+                    ),
+                },
+                num_rows="fixed",
+                use_container_width=True,
+                hide_index=True,
+                key=f"ac_editor_{selected_flight}_{_ac_count}",
+            )
+
+            if st.button(f"💾 Save aircraft for {selected_flight}", key=f"btn_save_ac_{selected_flight}"):
+                _ac_list = []
+                for _, _row in _edited_ac.iterrows():
+                    _ac_list.append({
+                        "type": str(_row.get("type") or _default_type).strip(),
+                        "reg":  str(_row.get("reg")  or "").strip(),
+                    })
+                ingest.save_flight_aircraft(_save_day, selected_flight, _ac_list)
+                st.session_state["day_aircraft"][selected_flight] = _ac_list
+                _seat_str = " / ".join(
+                    f"{ingest.AIRCRAFT_TYPE_OPTS.get(a['type'], {}).get('seats', '?')} seats"
+                    for a in _ac_list
+                )
+                st.success(
+                    f"Saved {len(_ac_list)} aircraft for {selected_flight} on {_save_day}. "
+                    f"Capacities: {_seat_str}"
+                )
+            elif _saved_ac:
+                st.caption(
+                    f"Previously saved: {len(_saved_ac)} aircraft — "
+                    f"{', '.join(a.get('type','?') + (' ' + a['reg'] if a.get('reg') else '') for a in _saved_ac)}"
+                )
+
         # PDF upload for this flight
         pax_file = st.file_uploader(
             f"Passenger list PDF for {selected_flight}",
@@ -284,8 +380,16 @@ with tab_build:
                         f"**{', '.join(sorted(unknown))}**"
                     )
 
-                # Append to accumulated manifest
-                st.session_state.manifest_rows.extend(df_new.to_dict("records"))
+                # Tag each row with its source flight so it can be removed later
+                _new_rows = df_new.to_dict("records")
+                for _r in _new_rows:
+                    _r["_src_flight"] = selected_flight
+                # Remove any previously added rows for this flight (replace, don't double-add)
+                st.session_state.manifest_rows = [
+                    r for r in st.session_state.manifest_rows
+                    if r.get("_src_flight") != selected_flight
+                ]
+                st.session_state.manifest_rows.extend(_new_rows)
 
                 st.success(
                     f"Added {selected_flight}: {len(od_list)} O-D groups, "
@@ -314,12 +418,30 @@ with tab_build:
         st.info("No flights added yet. Select a flight above and upload its PDF.")
     else:
         df_manifest = pd.DataFrame(rows)
-        st.dataframe(df_manifest, use_container_width=True, hide_index=True)
+        # Show table without internal tracking column
+        _display_cols = [c for c in df_manifest.columns if c != "_src_flight"]
+        st.dataframe(df_manifest[_display_cols], use_container_width=True, hide_index=True)
         st.caption(
             f"{len(rows)} demand rows · "
             f"{df_manifest['pax'].sum()} total pax · "
             f"date: {st.session_state.manifest_date or 'unknown'}"
         )
+
+        # Per-flight remove buttons
+        _flights_in_manifest = sorted({r.get("_src_flight", "?") for r in rows})
+        if len(_flights_in_manifest) > 1 or _flights_in_manifest != [selected_flight]:
+            st.markdown("**Remove a flight from manifest:**")
+            _rm_cols = st.columns(min(len(_flights_in_manifest), 5))
+            for _ci, _fn in enumerate(_flights_in_manifest):
+                _fn_pax = sum(r["pax"] for r in rows if r.get("_src_flight") == _fn)
+                if _rm_cols[_ci % 5].button(
+                    f"✖ {_fn} ({_fn_pax} pax)", key=f"rm_{_fn}"
+                ):
+                    st.session_state.manifest_rows = [
+                        r for r in st.session_state.manifest_rows
+                        if r.get("_src_flight") != _fn
+                    ]
+                    st.rerun()
 
         btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 2])
 
@@ -332,14 +454,14 @@ with tab_build:
         with btn_col2:
             st.download_button(
                 "⬇ Download manifest.csv",
-                df_manifest.to_csv(index=False).encode(),
+                df_manifest[_display_cols].to_csv(index=False).encode(),
                 file_name="manifest.csv",
                 mime="text/csv",
             )
 
         with btn_col3:
             if st.button("✈ Send to Optimizer →", type="primary", key="btn_send"):
-                st.session_state.built_manifest = df_manifest.copy()
+                st.session_state.built_manifest = df_manifest[_display_cols].copy()
                 st.session_state["sched_result"] = None  # clear any previous schedule
                 st.success("Manifest sent. Switch to the **Run Optimizer** tab above.")
 
@@ -357,17 +479,28 @@ with tab_build:
         st.info("No passenger lists saved yet — upload a PDF above to create a record.")
     else:
         st.caption(
-            "These PDFs are stored in `data/passenger_lists/`. "
-            "To replace a file, re-upload the corrected PDF for the same flight in the section above."
+            "Upload a new PDF for the same flight above to replace its entry. "
+            "Delete individual files below or clear all at once."
         )
-        _hdr = st.columns([3, 1, 1])
+
+        _pdf_top1, _pdf_top2 = st.columns([1, 4])
+        if _pdf_top1.button("🗑 Delete All PDFs", key="btn_del_all_pdfs"):
+            for _f in _saved:
+                try:
+                    os.remove(os.path.join(_plist_dir, _f))
+                except OSError:
+                    pass
+            st.rerun()
+
+        _hdr = st.columns([3, 1, 1, 1])
         _hdr[0].markdown("**File**")
         _hdr[1].markdown("**Size**")
         _hdr[2].markdown("**Download**")
+        _hdr[3].markdown("**Delete**")
         for _fname in _saved:
             _fpath = os.path.join(_plist_dir, _fname)
             _fsize = os.path.getsize(_fpath)
-            _col_name, _col_size, _col_dl = st.columns([3, 1, 1])
+            _col_name, _col_size, _col_dl, _col_del = st.columns([3, 1, 1, 1])
             _col_name.write(f"📄 {_fname}")
             _col_size.write(f"{_fsize // 1024} KB" if _fsize >= 1024 else f"{_fsize} B")
             with open(_fpath, "rb") as _fh:
@@ -378,6 +511,12 @@ with tab_build:
                     mime="application/pdf",
                     key=f"dl_plist_{_fname}",
                 )
+            if _col_del.button("❌", key=f"del_pdf_{_fname}", help=f"Delete {_fname}"):
+                try:
+                    os.remove(_fpath)
+                except OSError:
+                    pass
+                st.rerun()
 
 
 # =========================================================================== #
@@ -419,7 +558,35 @@ with tab_optimize:
 
             _load_ok = True
             try:
-                fleet    = pc.load_fleet(f"{data_dir}/fleet.csv")
+                # Fleet: prefer per-day aircraft assignments over static fleet.csv
+                _day_str  = st.session_state.get("manifest_date") or "unknown"
+                _day_ac   = ingest.load_all_day_aircraft(_day_str)
+                _rt_master = ingest.load_flight_routes()
+
+                if _day_ac:
+                    _specs = ingest.build_fleet_specs(_day_ac, _rt_master)
+                    if _specs:
+                        fleet = [
+                            pc.Aircraft(
+                                reg=s["reg"], type=s["type"], base=s["base"],
+                                seats=s["seats"], payload_kg=s["payload_kg"],
+                                cruise_kts=s["cruise_kts"],
+                                available_from=s["available_from"],
+                                available_until=s["available_until"],
+                                max_duty_min=s["max_duty_min"],
+                                turnaround_min=s["turnaround_min"],
+                            )
+                            for s in _specs
+                        ]
+                        st.info(
+                            f"Using {len(fleet)} aircraft from today's assignments "
+                            f"({', '.join(s['type'] + ' ' + s['reg'] for s in _specs)})."
+                        )
+                    else:
+                        fleet = pc.load_fleet(f"{data_dir}/fleet.csv")
+                else:
+                    fleet = pc.load_fleet(f"{data_dir}/fleet.csv")
+
                 manifest = pc.load_manifest(manifest_path)
             except Exception as e:
                 st.error(f"Could not load data: {e}")
@@ -431,6 +598,9 @@ with tab_optimize:
                     pass
 
             if _load_ok:
+                # Split demands that exceed the largest aircraft's seat count
+                _max_seats = max(ac.seats for ac in fleet) if fleet else 12
+                manifest   = _split_large_demands(manifest, _max_seats)
                 demands = {d.id: d for d in manifest}
                 w, lm   = pc.Weights(), pc.LoadModel()
 
