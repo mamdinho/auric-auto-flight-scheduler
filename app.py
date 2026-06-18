@@ -776,6 +776,13 @@ with tab_routes:
         "This is a one-time setup — routes are reused every day until the schedule changes."
     )
 
+    # Apply post-save redirect BEFORE any widgets are created
+    if st.session_state.get("_post_save_flight"):
+        _psf = st.session_state.pop("_post_save_flight")
+        st.session_state["routes_action_radio"] = "Edit existing flight"
+        st.session_state["new_flight_input_box"] = ""
+        st.session_state["sel_edit_flight"] = _psf
+
     routes_master_edit = ingest.load_flight_routes()
     configured = sorted(routes_master_edit.keys())
 
@@ -912,10 +919,10 @@ with tab_routes:
                         f"{ingest.AIRCRAFT_TYPE_OPTS.get(sel_ac_type, {}).get('name', sel_ac_type)} · "
                         f"{' → '.join(ingest.route_stop_sequence(routes_master_edit, edit_flight))}"
                     )
-                    # Reset form: switch back to Edit mode, pre-select the just-saved flight
-                    st.session_state["routes_action_radio"] = "Edit existing flight"
-                    st.session_state["new_flight_input_box"] = ""
-                    st.session_state["sel_edit_flight"] = edit_flight
+                    # Reset form: switch back to Edit mode, pre-select the just-saved flight.
+                    # Use a flag instead of setting the widget key directly (Streamlit 1.35+
+                    # raises StreamlitAPIException if you set a rendered widget's key).
+                    st.session_state["_post_save_flight"] = edit_flight
                     st.rerun()
         else:
             st.info("Select or create a flight on the left to edit its route.")

@@ -6,3 +6,6 @@ pdfplumber>=0.10
 
 # Production optimizer (heuristic fallback needs nothing beyond stdlib)
 ortools>=9.10,<10
+
+# Data processing
+pandas>=2.0
