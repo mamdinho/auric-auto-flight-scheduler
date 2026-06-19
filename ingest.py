@@ -425,11 +425,12 @@ def build_manifest(
             "connect_by":   connect_by_val,
             "earliest_dep": origin_dep.get(od["origin"], ""),
             "passengers":   ";".join(od.get("passengers", [])),
+            "flight_tag":   flight_num or "",
         })
 
     return pd.DataFrame(
         rows,
-        columns=["id","date","origin","dest","pax","connect_by","earliest_dep","passengers"],
+        columns=["id","date","origin","dest","pax","connect_by","earliest_dep","passengers","flight_tag"],
     )
 
 
@@ -629,6 +630,7 @@ def build_fleet_specs(
                 "max_duty_min":    s["max_duty_min"],
                 "turnaround_min":  s["turnaround_min"],
                 "return_to_base":  return_to_base,
+                "flight_tag":      flight_num,   # restricts this aircraft to its assigned flight
                 "next_route":      next_route,
             })
 

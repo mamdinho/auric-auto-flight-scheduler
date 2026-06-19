@@ -52,6 +52,7 @@ def _split_large_demands(manifest: list, max_seats: int) -> list:
                 connect_by=d.connect_by,
                 earliest_dep=d.earliest_dep,
                 passengers=pax_names[:cpax] if pax_names else None,
+                flight_tag=d.flight_tag,  # preserve flight ownership through splits
             ))
             pax_names = pax_names[cpax:]
             remaining -= cpax
@@ -620,6 +621,8 @@ with tab_optimize:
                                 max_duty_min=s["max_duty_min"],
                                 turnaround_min=s["turnaround_min"],
                                 return_to_base=s.get("return_to_base", True),
+                                flight_tag=s.get("flight_tag"),
+                                next_route=s.get("next_route"),
                             )
                             for s in _specs
                         ]

@@ -157,6 +157,20 @@ def build_and_solve(strips, fleet, manifest, w: pc.Weights, lm: pc.LoadModel,
         routing.AddDisjunction([pi], half)
         routing.AddDisjunction([di], half)
 
+        # Flight-tag restriction: prevent vehicles from serving demands of a
+        # different flight.  Build the list of vehicles that ARE allowed, then
+        # exclude all others.  Aircraft without a flight_tag are unrestricted.
+        if d.flight_tag:
+            for v, ac in enumerate(fleet):
+                if ac.flight_tag is None:
+                    continue  # unrestricted vehicle — can serve any demand
+                allowed = {ac.flight_tag}
+                if ac.next_route:
+                    allowed.add(ac.next_route)
+                if d.flight_tag not in allowed:
+                    solver.Add(routing.VehicleVar(pi) != v)
+                    solver.Add(routing.VehicleVar(di) != v)
+
     # ---- SEARCH ----
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = (

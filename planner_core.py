@@ -76,7 +76,9 @@ class Aircraft:
     available_until: int  # duty end / last-light cap, minutes from midnight
     max_duty_min: int     # crew duty span limit (wheels-up first leg to on-blocks last)
     turnaround_min: int   # ground time per operational stop
-    return_to_base: bool = True  # if False, aircraft stays at its last stop (no base return leg)
+    return_to_base: bool = True   # if False, stays at last stop rather than repositioning home
+    flight_tag: str | None = None # flight this aircraft is assigned to; None = unrestricted
+    next_route: str | None = None # optional follow-on flight after finishing flight_tag
 
 
 @dataclass
@@ -89,6 +91,7 @@ class Demand:
     connect_by: list[int] | None = None  # one or more connecting-flight times at dest (minutes from midnight); semicolon-separated in CSV
     earliest_dep: int | None = None  # may not depart origin before this (minutes from midnight)
     passengers: list[str] | None = None  # individual passenger names from PDF; None if not available
+    flight_tag: str | None = None        # flight number this demand belongs to; enforced by optimizer
 
     def weight_kg(self, lm: LoadModel) -> float:
         return self.pax * (lm.pax_weight_kg + lm.bag_kg)
@@ -136,6 +139,8 @@ def load_fleet(path: str) -> list[Aircraft]:
                 available_from=int(r["available_from"]), available_until=int(r["available_until"]),
                 max_duty_min=int(r["max_duty_min"]), turnaround_min=int(r["turnaround_min"]),
                 return_to_base=_b(r.get("return_to_base", "1")),
+                flight_tag=(r.get("flight_tag") or "").strip() or None,
+                next_route=(r.get("next_route") or "").strip() or None,
             ))
     return out
 
@@ -152,6 +157,7 @@ def load_manifest(path: str) -> list[Demand]:
                 connect_by=_opt_int_list(r.get("connect_by")),
                 earliest_dep=_opt_int(r.get("earliest_dep")),
                 passengers=pax_names,
+                flight_tag=(r.get("flight_tag") or "").strip() or None,
             ))
     return out
 
@@ -347,6 +353,19 @@ def evaluate_route(ac: Aircraft, stops: list[Stop],
         # --- apply the pickup/delivery event AT this stop ---
         if st.kind == "pickup":
             d = demands[st.demand_id]
+            # Flight-tag restriction: aircraft assigned to a specific flight may
+            # only serve demands from that flight (or its next_route follow-on).
+            if ac.flight_tag is not None and d.flight_tag is not None:
+                allowed = {ac.flight_tag}
+                if ac.next_route:
+                    allowed.add(ac.next_route)
+                if d.flight_tag not in allowed:
+                    res.feasible = False
+                    res.reason = (
+                        f"aircraft {ac.reg} (flight {ac.flight_tag}) "
+                        f"cannot serve demand {d.id} (flight {d.flight_tag})"
+                    )
+                    return res
             if d.earliest_dep is not None and service_start < d.earliest_dep - 1e-6:
                 service_start = float(d.earliest_dep)  # hold for the pax
             onboard_pax += d.pax
