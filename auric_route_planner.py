@@ -193,6 +193,13 @@ def build_and_solve(strips, fleet, manifest, w: pc.Weights, lm: pc.LoadModel,
         for did in removed:
             served.discard(did)
 
+        # OR-Tools uses a soft connect_by penalty; the hard evaluator may
+        # still flag time-window violations.  Strip any such demands so that
+        # phantom pickups never appear in the schedule.
+        seq, tw_removed = pc.strip_time_window_demands(seq, ac, strips, demands, lm)
+        for did in tw_removed:
+            served.discard(did)
+
         res = pc.evaluate_route(ac, seq, strips, demands, lm)
         routes[ac.reg] = (ac, seq, res)
 

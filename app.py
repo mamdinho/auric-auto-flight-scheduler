@@ -666,7 +666,7 @@ with tab_optimize:
 
                 sched_rows = []
                 for reg, (ac, stops_seq, res) in routes.items():
-                    if not res.used:
+                    if not res.used or not res.feasible:
                         continue
 
                     # Aggregate per-location pax events for this aircraft so
@@ -714,7 +714,9 @@ with tab_optimize:
                         })
 
                 booking_rows = []
-                for reg, (ac, stops_seq, _) in routes.items():
+                for reg, (ac, stops_seq, res) in routes.items():
+                    if not res.used or not res.feasible:
+                        continue
                     for s in stops_seq:
                         if s.kind != "pickup":
                             continue

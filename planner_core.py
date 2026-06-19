@@ -232,6 +232,35 @@ def has_backtrack(stops: list[Stop]) -> bool:
     return False
 
 
+def strip_time_window_demands(
+    stops: list[Stop], ac: "Aircraft",
+    strips: dict[str, "Airstrip"], demands: dict[str, "Demand"], lm: "LoadModel",
+) -> tuple[list[Stop], set[str]]:
+    """Iteratively remove demands whose deliveries violate the schedule time
+    window until evaluate_route returns feasible.  Mirrors strip_backtrack_demands.
+
+    When evaluate_route hits a 'late delivery' violation at stops[idx] it has
+    appended exactly idx legs, so stops[len(res.legs)] is always the offending
+    delivery stop — no need to re-walk the route.
+
+    Returns (cleaned stops, set of removed demand IDs).
+    """
+    removed: set[str] = set()
+    while True:
+        res = evaluate_route(ac, stops, strips, demands, lm)
+        if res.feasible:
+            break
+        if "late delivery" not in res.reason:
+            break  # different hard constraint — caller handles
+        v_idx = len(res.legs)
+        if v_idx >= len(stops) or not stops[v_idx].demand_id:
+            break
+        offender = stops[v_idx].demand_id
+        removed.add(offender)
+        stops = [s for s in stops if s.demand_id != offender]
+    return stops, removed
+
+
 def strip_backtrack_demands(stops: list[Stop]) -> tuple[list[Stop], set[str]]:
     """Iteratively remove the earliest demand that causes a backtrack until the
     route is clean. Returns (cleaned stops, set of removed demand IDs)."""
