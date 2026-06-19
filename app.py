@@ -256,7 +256,18 @@ with tab_build:
         _save_day = st.session_state.manifest_date or "unknown"
         _saved_ac = ingest.load_flight_aircraft(_save_day, selected_flight)
         _default_type = ingest.route_aircraft_type(routes_master, selected_flight) or "C208B"
-        _type_keys = list(ingest.AIRCRAFT_TYPE_OPTS.keys())
+        # Build list of friendly labels "Caravan (C208B)" for the type selectbox
+        _type_labels = [
+            f"{v['short_name']} ({k})"
+            for k, v in ingest.AIRCRAFT_TYPE_OPTS.items()
+        ]
+        _label_to_key = {
+            f"{v['short_name']} ({k})": k
+            for k, v in ingest.AIRCRAFT_TYPE_OPTS.items()
+        }
+        _key_to_label = {k: v for v, k in _label_to_key.items()}
+
+        _other_flights = [f for f in configured_flights if f != selected_flight]
 
         with st.expander(
             f"Aircraft available today for {selected_flight} (required for capacity planning)",
@@ -273,21 +284,44 @@ with tab_build:
             _ac_rows = []
             for _i in range(_ac_count):
                 if _i < len(_saved_ac):
-                    _ac_rows.append({"type": _saved_ac[_i].get("type", _default_type),
-                                     "reg":  _saved_ac[_i].get("reg", "")})
+                    _sv = _saved_ac[_i]
+                    _ac_rows.append({
+                        "type":            _key_to_label.get(_sv.get("type", _default_type),
+                                                             _key_to_label.get(_default_type, _type_labels[0])),
+                        "reg":             _sv.get("reg", ""),
+                        "return_to_base":  bool(_sv.get("return_to_base", True)),
+                        "next_route":      _sv.get("next_route", ""),
+                    })
                 else:
-                    _ac_rows.append({"type": _default_type, "reg": ""})
+                    _ac_rows.append({
+                        "type":           _key_to_label.get(_default_type, _type_labels[0]),
+                        "reg":            "",
+                        "return_to_base": True,
+                        "next_route":     "",
+                    })
 
             _edited_ac = st.data_editor(
                 pd.DataFrame(_ac_rows),
                 column_config={
                     "type": st.column_config.SelectboxColumn(
-                        "Type", options=_type_keys, required=True,
-                        help="C208B = Caravan (12 pax max), DHC8-* = Dash-8, PC12",
+                        "Aircraft Type",
+                        options=_type_labels,
+                        required=True,
+                        help="Caravan = C208B (12 pax), Pilatus = PC-12 (8 pax), Dash-8 = up to 50 pax",
                     ),
                     "reg": st.column_config.TextColumn(
                         "Registration (optional)",
                         help="e.g. 5H-AUB — leave blank to auto-assign",
+                    ),
+                    "return_to_base": st.column_config.CheckboxColumn(
+                        "Return to Base",
+                        help="If unchecked, aircraft stays at its last stop instead of flying back to base",
+                        default=True,
+                    ),
+                    "next_route": st.column_config.SelectboxColumn(
+                        "Continue to Route",
+                        options=[""] + _other_flights,
+                        help="If set, this aircraft continues to the selected route when finished here (automatically disables 'Return to Base')",
                     ),
                 },
                 num_rows="fixed",
@@ -299,9 +333,15 @@ with tab_build:
             if st.button(f"💾 Save aircraft for {selected_flight}", key=f"btn_save_ac_{selected_flight}"):
                 _ac_list = []
                 for _, _row in _edited_ac.iterrows():
+                    _label = str(_row.get("type") or _type_labels[0]).strip()
+                    _type_key = _label_to_key.get(_label, _default_type)
+                    _next = str(_row.get("next_route") or "").strip()
+                    _rtb  = bool(_row.get("return_to_base", True)) if not _next else False
                     _ac_list.append({
-                        "type": str(_row.get("type") or _default_type).strip(),
-                        "reg":  str(_row.get("reg")  or "").strip(),
+                        "type":            _type_key,
+                        "reg":             str(_row.get("reg") or "").strip(),
+                        "return_to_base":  _rtb,
+                        "next_route":      _next,
                     })
                 ingest.save_flight_aircraft(_save_day, selected_flight, _ac_list)
                 st.session_state["day_aircraft"][selected_flight] = _ac_list
@@ -314,10 +354,14 @@ with tab_build:
                     f"Capacities: {_seat_str}"
                 )
             elif _saved_ac:
-                st.caption(
-                    f"Previously saved: {len(_saved_ac)} aircraft — "
-                    f"{', '.join(a.get('type','?') + (' ' + a['reg'] if a.get('reg') else '') for a in _saved_ac)}"
-                )
+                _summary = []
+                for a in _saved_ac:
+                    _t = ingest.AIRCRAFT_TYPE_OPTS.get(a.get("type",""), {}).get("short_name", a.get("type","?"))
+                    _r = a.get("reg","") or ""
+                    _rtb = "" if a.get("return_to_base", True) else " [stays]"
+                    _nr  = f" → {a['next_route']}" if a.get("next_route") else ""
+                    _summary.append(f"{_t}{(' ' + _r) if _r else ''}{_rtb}{_nr}")
+                st.caption(f"Previously saved: {', '.join(_summary)}")
 
         # PDF upload for this flight
         pax_file = st.file_uploader(
@@ -575,12 +619,19 @@ with tab_optimize:
                                 available_until=s["available_until"],
                                 max_duty_min=s["max_duty_min"],
                                 turnaround_min=s["turnaround_min"],
+                                return_to_base=s.get("return_to_base", True),
                             )
                             for s in _specs
                         ]
+                        _ac_labels = []
+                        for s in _specs:
+                            _sn = ingest.AIRCRAFT_TYPE_OPTS.get(s["type"], {}).get("short_name", s["type"])
+                            _nr = f"→{s['next_route']}" if s.get("next_route") else ""
+                            _rtb = "" if s.get("return_to_base", True) else "[stays]"
+                            _ac_labels.append(f"{_sn} {s['reg']} {_rtb}{_nr}".strip())
                         st.info(
-                            f"Using {len(fleet)} aircraft from today's assignments "
-                            f"({', '.join(s['type'] + ' ' + s['reg'] for s in _specs)})."
+                            f"Using {len(fleet)} aircraft from today's assignments: "
+                            f"{', '.join(_ac_labels)}"
                         )
                     else:
                         fleet = pc.load_fleet(f"{data_dir}/fleet.csv")

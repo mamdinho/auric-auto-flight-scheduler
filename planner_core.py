@@ -76,6 +76,7 @@ class Aircraft:
     available_until: int  # duty end / last-light cap, minutes from midnight
     max_duty_min: int     # crew duty span limit (wheels-up first leg to on-blocks last)
     turnaround_min: int   # ground time per operational stop
+    return_to_base: bool = True  # if False, aircraft stays at its last stop (no base return leg)
 
 
 @dataclass
@@ -134,6 +135,7 @@ def load_fleet(path: str) -> list[Aircraft]:
                 cruise_kts=float(r["cruise_kts"]),
                 available_from=int(r["available_from"]), available_until=int(r["available_until"]),
                 max_duty_min=int(r["max_duty_min"]), turnaround_min=int(r["turnaround_min"]),
+                return_to_base=_b(r.get("return_to_base", "1")),
             ))
     return out
 
@@ -282,6 +284,11 @@ def evaluate_route(ac: Aircraft, stops: list[Stop],
 
     for idx in range(1, len(stops)):
         st = stops[idx]
+
+        # If the aircraft does not return to base, skip the final base-return leg
+        if st.kind == "end" and not ac.return_to_base and prev.code != ac.base:
+            break
+
         cur = strips[st.code]
         blk = block_minutes(prev, cur, ac.cruise_kts, lm)
         depart = t
@@ -330,10 +337,18 @@ def evaluate_route(ac: Aircraft, stops: list[Stop],
             d = demands[st.demand_id]
             onboard_pax -= d.pax
             onboard_kg -= d.weight_kg(lm)
+            # connect_by is a HARD schedule-window constraint (±10 min of published arrival)
             if d.connect_by is not None:
                 last_conn = max(d.connect_by)
-                if service_start > last_conn:
-                    res.connection_late_min += (service_start - last_conn)
+                if service_start > last_conn + 1e-6:
+                    res.feasible = False
+                    _t = int(service_start)
+                    res.reason = (
+                        f"late delivery at {cur.code}: "
+                        f"arrive {_t//60:02d}:{_t%60:02d} > "
+                        f"window {last_conn//60:02d}:{last_conn%60:02d}"
+                    )
+                    return res
 
         # depart after ground time (no turnaround at the closing depot leg)
         turn = 0 if st.kind == "end" else ac.turnaround_min

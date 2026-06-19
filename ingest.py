@@ -46,31 +46,37 @@ def _resolve_aliases(od_list: list[dict]) -> list[dict]:
 AIRCRAFT_TYPE_OPTS: dict[str, dict] = {
     # payload_kg must cover seats × 99 kg/pax (84 kg pax + 15 kg bag) so the
     # seat count is always the binding capacity constraint, not weight.
+    # short_name is the plain-English label shown in the ops UI.
     "C208B": {
-        "name": "Caravan (C208B)", "seats": 12,
-        "payload_kg": 1200, "cruise_kts": 160,
+        "name": "Caravan (C208B)", "short_name": "Caravan",
+        "seats": 12, "payload_kg": 1200, "cruise_kts": 160,
         "turnaround_min": 20, "max_duty_min": 600, "available_until": 1110,
     },
     "DHC8-100": {
-        "name": "Dash-8 Series 100", "seats": 37,
-        "payload_kg": 3700, "cruise_kts": 265,
+        "name": "Dash-8 Series 100", "short_name": "Dash-8 100",
+        "seats": 37, "payload_kg": 3700, "cruise_kts": 265,
         "turnaround_min": 25, "max_duty_min": 600, "available_until": 1110,
     },
     "DHC8-200": {
-        "name": "Dash-8 Series 200", "seats": 39,
-        "payload_kg": 3900, "cruise_kts": 265,
+        "name": "Dash-8 Series 200", "short_name": "Dash-8 200",
+        "seats": 39, "payload_kg": 3900, "cruise_kts": 265,
         "turnaround_min": 25, "max_duty_min": 600, "available_until": 1110,
     },
     "DHC8-300": {
-        "name": "Dash-8 Series 300", "seats": 50,
-        "payload_kg": 5000, "cruise_kts": 285,
+        "name": "Dash-8 Series 300", "short_name": "Dash-8 300",
+        "seats": 50, "payload_kg": 5000, "cruise_kts": 285,
         "turnaround_min": 30, "max_duty_min": 600, "available_until": 1110,
     },
     "PC12": {
-        "name": "PC-12", "seats": 8,
-        "payload_kg": 1100, "cruise_kts": 275,
+        "name": "PC-12", "short_name": "Pilatus",
+        "seats": 8, "payload_kg": 1100, "cruise_kts": 275,
         "turnaround_min": 15, "max_duty_min": 600, "available_until": 1110,
     },
+}
+
+# Map short_name → type key so the UI can resolve the user's friendly label
+AIRCRAFT_SHORT_TO_KEY: dict[str, str] = {
+    v["short_name"]: k for k, v in AIRCRAFT_TYPE_OPTS.items()
 }
 
 
@@ -384,7 +390,9 @@ def build_manifest(
     Convert an O-D demand list + timings into a manifest DataFrame.
 
     • earliest_dep  — departure time at the origin stop (minutes since midnight)
-    • connect_by    — left blank; ops team fills in if a connection is required
+    • connect_by    — schedule arrival + 10 min tolerance, enforced as a hard
+                      window by the optimizer (aircraft must arrive within 10 min
+                      of the published schedule)
     """
     # origin → earliest outbound departure on this flight
     origin_dep: dict[str, int] = {}
@@ -393,16 +401,28 @@ def build_manifest(
             if frm not in origin_dep or t["dep_min"] < origin_dep[frm]:
                 origin_dep[frm] = t["dep_min"]
 
+    # destination → latest scheduled arrival (used as the schedule window baseline)
+    dest_sched_arr: dict[str, int] = {}
+    for (_, to), t in timings.items():
+        arr = t.get("arr_min")
+        if arr is not None and isinstance(arr, (int, float)):
+            # Use the FIRST (earliest) published arrival if a stop appears multiple times
+            if to not in dest_sched_arr or arr < dest_sched_arr[to]:
+                dest_sched_arr[to] = int(arr)
+
     prefix = flight_num or "D"
     rows = []
     for i, od in enumerate(od_list, start=1):
+        sched_arr = dest_sched_arr.get(od["dest"])
+        # Allow up to 10 minutes later than the published arrival time
+        connect_by_val = str(sched_arr + 10) if sched_arr is not None else ""
         rows.append({
             "id":           f"{prefix}-{i:02d}",
             "date":         date,
             "origin":       od["origin"],
             "dest":         od["dest"],
             "pax":          od["pax"],
-            "connect_by":   "",
+            "connect_by":   connect_by_val,
             "earliest_dep": origin_dep.get(od["origin"], ""),
             "passengers":   ";".join(od.get("passengers", [])),
         })
@@ -571,6 +591,11 @@ def build_fleet_specs(
     Each dict has the same fields as a fleet.csv row so app.py can build
     pc.Aircraft objects directly.  Assignments without a matching route are
     skipped.  Duplicate registrations across flights are deduplicated.
+
+    Supports extra per-aircraft JSON fields:
+      return_to_base (bool, default True)  — if False the aircraft stays at its last stop
+      next_route (str, optional)           — flight number the aircraft continues to after
+                                             this one; automatically sets return_to_base=False
     """
     specs: list[dict] = []
     seen_regs: set[str] = set()
@@ -583,23 +608,28 @@ def build_fleet_specs(
         first_dep    = _hhmm_to_min(legs[0].get("dep", "06:00")) or 360
 
         for i, ac_spec in enumerate(aircraft_list):
-            ac_type = ac_spec.get("type", "C208B")
-            reg     = (ac_spec.get("reg") or "").strip() or f"{flight_num}-{ac_type}-{i + 1}"
+            ac_type    = ac_spec.get("type", "C208B")
+            reg        = (ac_spec.get("reg") or "").strip() or f"{flight_num}-{ac_type}-{i + 1}"
+            next_route = (ac_spec.get("next_route") or "").strip() or None
+            # aircraft continuing to another route must NOT return to base between the two
+            return_to_base = False if next_route else bool(ac_spec.get("return_to_base", True))
             if reg in seen_regs:
                 continue
             seen_regs.add(reg)
             s = AIRCRAFT_TYPE_OPTS.get(ac_type, AIRCRAFT_TYPE_OPTS["C208B"])
             specs.append({
-                "reg":            reg,
-                "type":           ac_type,
-                "base":           base_airport,
-                "seats":          s["seats"],
-                "payload_kg":     s["payload_kg"],
-                "cruise_kts":     s["cruise_kts"],
-                "available_from": first_dep,
+                "reg":             reg,
+                "type":            ac_type,
+                "base":            base_airport,
+                "seats":           s["seats"],
+                "payload_kg":      s["payload_kg"],
+                "cruise_kts":      s["cruise_kts"],
+                "available_from":  first_dep,
                 "available_until": s["available_until"],
-                "max_duty_min":   s["max_duty_min"],
-                "turnaround_min": s["turnaround_min"],
+                "max_duty_min":    s["max_duty_min"],
+                "turnaround_min":  s["turnaround_min"],
+                "return_to_base":  return_to_base,
+                "next_route":      next_route,
             })
 
     return specs
