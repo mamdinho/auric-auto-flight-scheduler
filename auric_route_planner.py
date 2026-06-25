@@ -109,22 +109,36 @@ def build_and_solve(strips, fleet, manifest, w: pc.Weights, lm: pc.LoadModel,
     # use a representative speed for the time dimension (homogeneous fleet)
     rep_speed = sum(ac.cruise_kts for ac in fleet) / len(fleet)
     turn = max(ac.turnaround_min for ac in fleet)
-    def time_cb(from_index, to_index):
-        fn = manager.IndexToNode(from_index)
-        a = strips[code_of(fn)]; b = strips[code_of(manager.IndexToNode(to_index))]
-        t = pc.block_minutes(a, b, rep_speed, lm)
-        # Only charge ground turnaround when actually departing this airstrip.
-        # Several demands sharing one origin/destination board or deplane in a
-        # single ground event, not one full turnaround each (mirrors the same
-        # fix in evaluate_route) — without this, a==b (same-code) transitions
-        # between co-located pickups/deliveries would each tack on a needless
-        # turnaround and starve the route of time it should have available.
-        if nodes[fn][1] != "depot" and a.code != b.code:
-            t += turn
-        return int(round(t))
-    time_idx = routing.RegisterTransitCallback(time_cb)
     horizon = max(ac.available_until for ac in fleet)
-    routing.AddDimension(time_idx, 24 * 60, horizon, False, "Time")
+
+    # Per-vehicle time callback (not a single shared one): a vehicle with
+    # return_to_base=False never has to fly its last leg back to base, so the
+    # transit INTO the depot/end node must be free for it. A single shared
+    # callback can't express this (it has no vehicle index), and without it
+    # every such aircraft was silently being charged real block time + duty
+    # budget for a return flight that doesn't happen -- confirmed measurably
+    # tightening duty/availability windows on every return_to_base=False
+    # aircraft (i.e. most of this fleet, by design).
+    time_cb_indices = []
+    for v, ac in enumerate(fleet):
+        def make_time_cb(ac):
+            def cb(from_index, to_index):
+                fn = manager.IndexToNode(from_index)
+                tn = manager.IndexToNode(to_index)
+                a = strips[code_of(fn)]; b = strips[code_of(tn)]
+                if not ac.return_to_base and nodes[tn][1] == "depot" and a.code != b.code:
+                    return 0
+                t = pc.block_minutes(a, b, rep_speed, lm)
+                # Only charge ground turnaround when actually departing this
+                # airstrip. Several demands sharing one origin/destination
+                # board or deplane in a single ground event, not one full
+                # turnaround each (mirrors the same fix in evaluate_route).
+                if nodes[fn][1] != "depot" and a.code != b.code:
+                    t += turn
+                return int(round(t))
+            return cb
+        time_cb_indices.append(routing.RegisterTransitCallback(make_time_cb(ac)))
+    routing.AddDimensionWithVehicleTransits(time_cb_indices, 24 * 60, horizon, False, "Time")
     time_dim = routing.GetDimensionOrDie("Time")
 
     # 5) crew duty span per vehicle + aircraft availability windows
