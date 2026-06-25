@@ -150,11 +150,14 @@ def build_and_solve(strips, fleet, manifest, w: pc.Weights, lm: pc.LoadModel,
             # evaluate_route enforces this window as HARD after extraction
             # (see strip_time_window_demands) — a route that is even one
             # minute late gets that demand stripped out entirely, same net
-            # effect as never having served it.  Price the soft bound here
-            # to match the drop penalty so OR-Tools' own search reaches the
-            # same conclusion instead of wasting moves on a "phantom" pickup
-            # that will be discarded post-solve.
-            late_penalty_per_min = max(1, int(w.w_drop * demands[did].pax * SCALE))
+            # effect as never having served it.  The soft bound here should
+            # discourage lateness WITHOUT creating a cost cliff so steep that
+            # cheapest-insertion and local search treat "slightly late" as
+            # catastrophically as "infeasible" and avoid that region of the
+            # search space altogether -- ramp up to the drop-equivalent cost
+            # over ~10 minutes late (matching the schedule tolerance already
+            # built into the window) rather than reaching it after 1 minute.
+            late_penalty_per_min = max(1, int(w.w_drop * demands[did].pax * SCALE / 10))
             time_dim.SetCumulVarSoftUpperBound(
                 idx, max(demands[did].connect_by), late_penalty_per_min)
 
