@@ -89,7 +89,7 @@ def solve(strips, fleet, demand_list, w: pc.Weights, lm: pc.LoadModel):
 
     improved = True
     rounds = 0
-    while improved and rounds < 4:
+    while improved and rounds < 6:
         improved = False
         rounds += 1
         for d in list(demands.values()):
@@ -118,6 +118,44 @@ def solve(strips, fleet, demand_list, w: pc.Weights, lm: pc.LoadModel):
                 # revert both
                 routes[reg] = [s for s in routes[reg] if s.demand_id != d.id]
                 routes[holder] = saved
+
+    # ---- swap pass: exchange two demands between their routes at once ----
+    # Single-demand relocation can get stuck when neither demand fits into the
+    # other's route alone (e.g. tight seats) but swapping both frees enough
+    # capacity on each side. Bounded to keep runtime predictable on busy days.
+    served_demands = [d for d in demand_list if d not in dropped]
+    if len(served_demands) <= 80:
+        for _ in range(2):
+            swapped_any = False
+            for i in range(len(served_demands)):
+                for j in range(i + 1, len(served_demands)):
+                    da, db = served_demands[i], served_demands[j]
+                    ra = next((reg for reg, st_ in routes.items()
+                              if any(s.demand_id == da.id for s in st_)), None)
+                    rb = next((reg for reg, st_ in routes.items()
+                              if any(s.demand_id == db.id for s in st_)), None)
+                    if ra is None or rb is None or ra == rb:
+                        continue
+                    before = total_cost()
+                    saved_a, saved_b = routes[ra], routes[rb]
+                    routes[ra] = [s for s in saved_a if s.demand_id != da.id]
+                    routes[rb] = [s for s in saved_b if s.demand_id != db.id]
+                    ins_a = best_insertion(da)
+                    ins_b = best_insertion(db)
+                    if ins_a is None or ins_b is None:
+                        routes[ra], routes[rb] = saved_a, saved_b
+                        continue
+                    _, reg_a, stops_a = ins_a
+                    routes[reg_a] = stops_a
+                    _, reg_b, stops_b = ins_b
+                    routes[reg_b] = stops_b
+                    if total_cost() < before - 1e-6:
+                        swapped_any = True
+                    else:
+                        routes[ra] = saved_a
+                        routes[rb] = saved_b
+            if not swapped_any:
+                break
 
     # Second pass: assign any remaining dropped demands to aircraft that still
     # have capacity and duty time — accepts any feasible slot (no cost threshold)

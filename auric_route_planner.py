@@ -46,7 +46,7 @@ SCALE = 1  # OR-Tools wants integer costs; block minutes are already ~integers
 
 
 def build_and_solve(strips, fleet, manifest, w: pc.Weights, lm: pc.LoadModel,
-                    time_limit_s: int = 20):
+                    time_limit_s: int = 30):
     demands = {d.id: d for d in manifest}
 
     # ---- NODES: per-vehicle depot, then a pickup + delivery node per demand ----
@@ -128,7 +128,8 @@ def build_and_solve(strips, fleet, manifest, w: pc.Weights, lm: pc.LoadModel,
         time_dim.CumulVar(s).SetRange(ac.available_from, ac.available_until)
         time_dim.CumulVar(e).SetRange(ac.available_from, ac.available_until)
 
-    # daylight field hours (hard) + earliest_dep + 4) connection windows (soft)
+    # daylight field hours (hard) + earliest_dep + 4) connection windows (soft,
+    # but priced to match the drop penalty)
     for n, (code, kind, did) in enumerate(nodes):
         if n < V:
             continue
@@ -140,8 +141,16 @@ def build_and_solve(strips, fleet, manifest, w: pc.Weights, lm: pc.LoadModel,
             lo = max(lo, demands[did].earliest_dep)
         time_dim.CumulVar(idx).SetRange(lo, hi)
         if kind == "delivery" and demands[did].connect_by is not None:
+            # evaluate_route enforces this window as HARD after extraction
+            # (see strip_time_window_demands) — a route that is even one
+            # minute late gets that demand stripped out entirely, same net
+            # effect as never having served it.  Price the soft bound here
+            # to match the drop penalty so OR-Tools' own search reaches the
+            # same conclusion instead of wasting moves on a "phantom" pickup
+            # that will be discarded post-solve.
+            late_penalty_per_min = max(1, int(w.w_drop * demands[did].pax * SCALE))
             time_dim.SetCumulVarSoftUpperBound(
-                idx, max(demands[did].connect_by), int(w.w_connection * SCALE))
+                idx, max(demands[did].connect_by), late_penalty_per_min)
 
     # ---- PICKUP & DELIVERY pairing: same vehicle, pickup before delivery ----
     solver = routing.solver()
@@ -172,11 +181,18 @@ def build_and_solve(strips, fleet, manifest, w: pc.Weights, lm: pc.LoadModel,
                     solver.Add(routing.VehicleVar(di) != v)
 
     # ---- SEARCH ----
+    # PARALLEL_CHEAPEST_INSERTION is the strongest first-solution strategy for
+    # pickup-delivery problems (it inserts each pair at its cheapest feasible
+    # slot rather than building routes greedily one stop at a time).
+    # GUIDED_LOCAL_SEARCH is OR-Tools' best general-purpose metaheuristic for
+    # VRP/PDPTW — it escapes local optima by penalizing repeatedly-used arcs,
+    # which consistently outperforms TABU_SEARCH on routing problems of this
+    # shape within the same time budget.
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = (
         routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION)
     params.local_search_metaheuristic = (
-        routing_enums_pb2.LocalSearchMetaheuristic.TABU_SEARCH)
+        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
     params.time_limit.FromSeconds(time_limit_s)
     print(f"  Solving... (up to {time_limit_s}s)", flush=True)
     solution = routing.SolveWithParameters(params)

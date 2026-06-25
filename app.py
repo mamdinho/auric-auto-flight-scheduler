@@ -60,17 +60,24 @@ def _split_large_demands(manifest: list, max_seats: int) -> list:
     return result
 
 
-def run_solver(strips, fleet, manifest, w, lm):
+def run_solver(strips, fleet, manifest, w, lm, time_limit_s: int = 30):
+    """Try OR-Tools first (it searches far more of the solution space and finds
+    materially shorter/more efficient plans); fall back to the heuristic only if
+    OR-Tools is unavailable or errors. Returns (routes, dropped, engine, fallback_reason)
+    — fallback_reason is None when OR-Tools succeeded, so the caller can warn ops
+    when they're seeing the lower-quality fallback instead of silently downgrading."""
+    fallback_reason = None
     try:
         from auric_route_planner import build_and_solve
-        result = build_and_solve(strips, fleet, manifest, w, lm, time_limit_s=15)
+        result = build_and_solve(strips, fleet, manifest, w, lm, time_limit_s=time_limit_s)
         if result is not None:
-            return result[0], result[1], "OR-Tools"
-    except Exception:
-        pass
+            return result[0], result[1], "OR-Tools", None
+        fallback_reason = "OR-Tools found no solution within the time limit"
+    except Exception as e:
+        fallback_reason = f"OR-Tools error: {e}"
     from demo_solver import solve
     routes, dropped = solve(strips, fleet, manifest, w, lm)
-    return routes, dropped, "Heuristic"
+    return routes, dropped, "Heuristic", fallback_reason
 
 
 # --------------------------------------------------------------------------- #
@@ -595,6 +602,23 @@ with tab_optimize:
         with st.expander("Manifest preview", expanded=True):
             st.dataframe(df_manifest, width='stretch', hide_index=True)
 
+        _n_demands = len(df_manifest)
+        _auto_time = max(15, min(90, 10 + 2 * _n_demands))
+        _effort_opts = {
+            f"Auto — recommended (~{_auto_time}s)": _auto_time,
+            "Fast (~15s)": 15,
+            "Thorough (~90s)": 90,
+        }
+        _effort = st.selectbox(
+            "Optimization effort",
+            list(_effort_opts.keys()),
+            index=0,
+            help="More search time lets OR-Tools explore a larger solution space and "
+                 "find a shorter, more efficient plan. Auto scales with the size of "
+                 "today's manifest — use Thorough for a big multi-flight day.",
+        )
+        _time_limit = _effort_opts[_effort]
+
         if st.button("Generate Schedule", type="primary", key="btn_optimize"):
 
             with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="") as f:
@@ -658,14 +682,22 @@ with tab_optimize:
                 demands = {d.id: d for d in manifest}
                 w, lm   = pc.Weights(), pc.LoadModel()
 
-                with st.spinner("Optimising routes…"):
-                    routes, dropped, engine = run_solver(strips, fleet, manifest, w, lm)
+                with st.spinner(f"Optimising routes… (up to {_time_limit}s)"):
+                    routes, dropped, engine, fallback_reason = run_solver(
+                        strips, fleet, manifest, w, lm, time_limit_s=_time_limit
+                    )
 
                 total_pax   = sum(d.pax for d in demands.values())
                 served_pax  = total_pax - sum(d.pax for d in dropped)
                 ac_used     = sum(1 for _, (_, _, res) in routes.items() if res.used)
                 total_block = sum(res.total_block_min for _, _, res in routes.values())
                 empty_block = sum(res.empty_block_min for _, _, res in routes.values())
+                _load_factors = [
+                    res.seats_used_peak / ac.seats
+                    for _, (ac, _, res) in routes.items()
+                    if res.used and res.feasible and ac.seats
+                ]
+                avg_load_factor = (sum(_load_factors) / len(_load_factors) * 100) if _load_factors else 0.0
 
                 sched_rows = []
                 for reg, (ac, stops_seq, res) in routes.items():
@@ -753,13 +785,15 @@ with tab_optimize:
 
                 # Store in session state so results survive download-button reruns
                 st.session_state["sched_result"] = {
-                    "engine":        engine,
-                    "served_pax":    served_pax,
-                    "total_pax":     total_pax,
-                    "ac_used":       ac_used,
-                    "total_block":   int(total_block),
-                    "empty_block":   int(empty_block),
-                    "dropped_pax":   sum(d.pax for d in dropped),
+                    "engine":          engine,
+                    "fallback_reason": fallback_reason,
+                    "served_pax":      served_pax,
+                    "total_pax":       total_pax,
+                    "ac_used":         ac_used,
+                    "total_block":     int(total_block),
+                    "empty_block":     int(empty_block),
+                    "avg_load_factor": avg_load_factor,
+                    "dropped_pax":     sum(d.pax for d in dropped),
                     "dropped_items": [
                         f"{d.id}: {d.origin} → {d.dest}, {d.pax} pax"
                         for d in dropped
@@ -771,9 +805,15 @@ with tab_optimize:
         # ---- Persistent results display (survives download-button reruns) ----
         sr = st.session_state.get("sched_result")
         if sr is not None:
+            if sr.get("fallback_reason"):
+                st.warning(
+                    f"OR-Tools could not be used ({sr['fallback_reason']}) — used the "
+                    "heuristic fallback instead. Plans from OR-Tools are usually shorter "
+                    "and more efficient; consider re-running once the issue is resolved."
+                )
             st.success(f"Schedule generated using the **{sr['engine']}** engine.")
 
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Pax Served",           f"{sr['served_pax']} / {sr['total_pax']}")
             c2.metric("Aircraft Used",         sr["ac_used"])
             c3.metric("Total Block Time",      f"{sr['total_block']} min")
@@ -783,6 +823,7 @@ with tab_optimize:
                 delta=f"-{sr['empty_block']} min wasted" if sr["empty_block"] else "0 min",
                 delta_color="inverse" if sr["empty_block"] else "off",
             )
+            c5.metric("Avg Load Factor", f"{sr.get('avg_load_factor', 0):.0f}%")
 
             if sr["dropped_items"]:
                 st.warning(
