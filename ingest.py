@@ -19,6 +19,7 @@ import pandas as pd
 _HERE = os.path.dirname(os.path.abspath(__file__))
 ROUTES_CSV = os.path.join(_HERE, "data", "flight_routes.csv")
 FLIGHT_AIRCRAFT_DIR = os.path.join(_HERE, "data", "flight_aircraft")
+SAVED_SCHEDULES_DIR = os.path.join(_HERE, "data", "saved_schedules")
 
 # Airstrip code aliases — maps names used in passenger PDFs to the internal
 # code used in airstrips.csv and flight_routes.csv.
@@ -635,6 +636,81 @@ def build_fleet_specs(
             })
 
     return specs
+
+
+# --------------------------------------------------------------------------- #
+# Saved schedules  (saved in data/saved_schedules/, opt-in per generated run)
+# --------------------------------------------------------------------------- #
+
+def save_schedule(
+    manifest_date: str,
+    generated_by: str,
+    generated_at: str,
+    engine: str,
+    summary: dict,
+    schedule_rows: list[dict],
+    booking_rows: list[dict],
+    dropped_diagnoses: list[dict],
+    base_dir: str = SAVED_SCHEDULES_DIR,
+) -> str:
+    """Persist one generated schedule with its metadata. Returns the filename
+    (not full path) so callers can use it as a stable handle for retrieval."""
+    os.makedirs(base_dir, exist_ok=True)
+    safe_date = (manifest_date or "unknown").replace("/", "-").replace("\\", "-")
+    safe_ts   = generated_at.replace(":", "").replace(" ", "_").replace("/", "-")
+    fname = f"{safe_date}_{safe_ts}.json"
+    path = os.path.join(base_dir, fname)
+    payload = {
+        "manifest_date":      manifest_date,
+        "generated_by":       generated_by,
+        "generated_at":       generated_at,
+        "engine":             engine,
+        "summary":            summary,
+        "schedule_rows":      schedule_rows,
+        "booking_rows":       booking_rows,
+        "dropped_diagnoses":  dropped_diagnoses,
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    return fname
+
+
+def list_saved_schedules(base_dir: str = SAVED_SCHEDULES_DIR) -> list[dict]:
+    """Lightweight summaries (no row-level data) sorted newest filename first."""
+    if not os.path.exists(base_dir):
+        return []
+    out = []
+    for fname in sorted(os.listdir(base_dir), reverse=True):
+        if not fname.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(base_dir, fname)) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        out.append({
+            "file":           fname,
+            "manifest_date":  data.get("manifest_date", ""),
+            "generated_by":   data.get("generated_by", ""),
+            "generated_at":   data.get("generated_at", ""),
+            "engine":         data.get("engine", ""),
+            "summary":        data.get("summary", {}),
+        })
+    return out
+
+
+def load_saved_schedule(fname: str, base_dir: str = SAVED_SCHEDULES_DIR) -> dict | None:
+    path = os.path.join(base_dir, os.path.basename(fname))
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def delete_saved_schedule(fname: str, base_dir: str = SAVED_SCHEDULES_DIR) -> None:
+    path = os.path.join(base_dir, os.path.basename(fname))
+    if os.path.exists(path):
+        os.remove(path)
 
 
 # --------------------------------------------------------------------------- #

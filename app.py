@@ -16,6 +16,7 @@ import io
 import os
 import sys
 import tempfile
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -26,6 +27,7 @@ if here not in sys.path:
 
 import planner_core as pc
 import ingest
+import auth
 
 
 # --------------------------------------------------------------------------- #
@@ -115,14 +117,80 @@ st.set_page_config(page_title="Auric Air Scheduler", page_icon="✈", layout="wi
 st.title("Auric Air — Daily Flight Scheduler")
 
 # --------------------------------------------------------------------------- #
+# Login gate — nothing below this renders until authenticated
+# --------------------------------------------------------------------------- #
+
+# data/users.json is gitignored (it holds password hashes), so a brand-new
+# deploy (e.g. a fresh Streamlit Cloud instance) starts with zero accounts.
+# Bootstrap the first admin from an env var rather than a hardcoded password
+# so this never crashes on a fresh checkout and never ships a credential in
+# source control.
+if not auth.load_users():
+    _bootstrap_pw = os.environ.get("AURIC_BOOTSTRAP_PW")
+    if _bootstrap_pw:
+        auth.ensure_bootstrap_admin("it@auricair.com", _bootstrap_pw)
+    else:
+        st.error(
+            "No user accounts exist yet. Set the **AURIC_BOOTSTRAP_PW** environment "
+            "variable (or Streamlit Cloud secret) and reload this page to create the "
+            "initial admin account (it@auricair.com)."
+        )
+        st.stop()
+
+if "auth_user" not in st.session_state:
+    st.session_state["auth_user"] = None
+
+if st.session_state["auth_user"] is None:
+    st.subheader("Sign in")
+    with st.form("login_form"):
+        _login_email = st.text_input("Email")
+        _login_pw = st.text_input("Password", type="password")
+        _login_submit = st.form_submit_button("Log in", type="primary")
+    if _login_submit:
+        _user = auth.authenticate(_login_email, _login_pw)
+        if _user:
+            st.session_state["auth_user"] = _user
+            st.rerun()
+        else:
+            st.error("Incorrect email or password.")
+    st.stop()
+
+_me = st.session_state["auth_user"]
+_is_admin = _me["role"] == "admin"
+
+# --------------------------------------------------------------------------- #
 # Sidebar — always-visible instructions
 # --------------------------------------------------------------------------- #
 
 with st.sidebar:
+    st.success(f"Signed in as **{_me['username']}** ({_me['role']})")
+    if st.button("Log out"):
+        st.session_state["auth_user"] = None
+        st.rerun()
+
+    with st.expander("Change my password"):
+        with st.form("change_pw_form"):
+            _cur_pw = st.text_input("Current password", type="password", key="cur_pw")
+            _new_pw = st.text_input("New password", type="password", key="new_pw")
+            _new_pw2 = st.text_input("Confirm new password", type="password", key="new_pw2")
+            _change_submit = st.form_submit_button("Update password")
+        if _change_submit:
+            if auth.authenticate(_me["username"], _cur_pw) is None:
+                st.error("Current password is incorrect.")
+            elif _new_pw != _new_pw2:
+                st.error("New passwords do not match.")
+            else:
+                try:
+                    auth.change_password(_me["username"], _new_pw)
+                    st.success("Password updated.")
+                except ValueError as e:
+                    st.error(str(e))
+
+    st.divider()
     st.header("How to use this app")
     st.markdown(
         """
-There are **three tabs** at the top of the page:
+There are tabs at the top of the page for each part of the daily workflow:
 
 ---
 
@@ -130,7 +198,7 @@ There are **three tabs** at the top of the page:
 Turn today's ops documents into an optimiser-ready manifest.
 
 1. **Upload Booking Analysis CSV** (once per day, optional — used to cross-check totals)
-2. **Select a flight** from the dropdown (routes are pre-configured in Tab 3)
+2. **Select a flight** from the dropdown (routes are pre-configured in Manage Routes)
 3. **Upload the passenger list PDF** for that flight
 4. Click **Add Flight to Manifest** — the O-D demand rows appear below
 5. Repeat steps 2-4 for every flight operating today
@@ -141,14 +209,30 @@ Turn today's ops documents into an optimiser-ready manifest.
 ### Tab 2 — Run Optimizer *(daily)*
 - Uses the manifest built in Tab 1, or upload your own `manifest.csv`
 - Click **Generate Schedule** to run OR-Tools (or heuristic fallback)
+- Any unserved pax get a detailed report explaining exactly why — hard
+  constraint vs. no aircraft was free — so ops knows what to fix
+- Click **Save this schedule** to keep a permanent record (who generated it
+  and when), retrievable later from the **Saved Schedules** tab
 - Download `schedule.csv` and `bookings.csv`
 
 ---
 
-### Tab 3 — Manage Routes *(one-time setup per flight)*
+### Tab — Saved Schedules
+Browse every schedule anyone has saved: who generated it, when, and the
+full detail behind it — including the unserved-pax report.
+
+---
+
+### Tab — Manage Routes *(one-time setup per flight)*
 - Select an existing flight number or type a new one
 - Enter the stop sequence and published leg times (dep/arr HH:MM)
 - Click **Save Route** — the flight is now available in Tab 1
+
+---
+
+### Tab — Admin *(admin accounts only)*
+- Create new user accounts (admin or ops role)
+- View everyone who has an account and when it was created
 
 ---
 
@@ -210,9 +294,12 @@ if "day_aircraft" not in st.session_state:
 # Tabs
 # --------------------------------------------------------------------------- #
 
-tab_build, tab_optimize, tab_routes = st.tabs(
-    ["📋 Build Manifest", "✈ Run Optimizer", "🗺 Manage Routes"]
-)
+_tab_labels = ["📋 Build Manifest", "✈ Run Optimizer", "📂 Saved Schedules", "🗺 Manage Routes"]
+if _is_admin:
+    _tab_labels.append("👤 Admin")
+_tabs = st.tabs(_tab_labels)
+tab_build, tab_optimize, tab_saved, tab_routes = _tabs[:4]
+tab_admin = _tabs[4] if _is_admin else None
 
 
 # =========================================================================== #
@@ -726,6 +813,21 @@ with tab_optimize:
                 ]
                 avg_load_factor = (sum(_load_factors) / len(_load_factors) * 100) if _load_factors else 0.0
 
+                # WHY each unserved booking couldn't be flown, in terms ops can
+                # act on: a hard constraint (loosen the window/limit to fix) vs.
+                # a fleet-size limit (add or free up an aircraft to fix).
+                _drop_diagnoses = pc.diagnose_dropped_demands(dropped, fleet, strips, lm)
+                dropped_diagnoses = [
+                    {
+                        "demand_id": diag.demand_id, "origin": diag.origin, "dest": diag.dest,
+                        "pax": diag.pax, "flight_tag": diag.flight_tag,
+                        "category": diag.category, "detail": diag.detail,
+                    }
+                    for diag in _drop_diagnoses
+                ]
+                _generated_by = _me["username"]
+                _generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+
                 sched_rows = []
                 for reg, (ac, stops_seq, res) in routes.items():
                     if not res.used or not res.feasible:
@@ -812,19 +914,24 @@ with tab_optimize:
 
                 # Store in session state so results survive download-button reruns
                 st.session_state["sched_result"] = {
-                    "engine":          engine,
-                    "fallback_reason": fallback_reason,
-                    "served_pax":      served_pax,
-                    "total_pax":       total_pax,
-                    "ac_used":         ac_used,
-                    "total_block":     int(total_block),
-                    "empty_block":     int(empty_block),
-                    "avg_load_factor": avg_load_factor,
-                    "dropped_pax":     sum(d.pax for d in dropped),
+                    "engine":            engine,
+                    "fallback_reason":   fallback_reason,
+                    "served_pax":        served_pax,
+                    "total_pax":         total_pax,
+                    "ac_used":           ac_used,
+                    "total_block":       int(total_block),
+                    "empty_block":       int(empty_block),
+                    "avg_load_factor":   avg_load_factor,
+                    "dropped_pax":       sum(d.pax for d in dropped),
                     "dropped_items": [
                         f"{d.id}: {d.origin} → {d.dest}, {d.pax} pax"
                         for d in dropped
                     ],
+                    "dropped_diagnoses": dropped_diagnoses,
+                    "generated_by":      _generated_by,
+                    "generated_at":      _generated_at,
+                    "manifest_date":     st.session_state.get("manifest_date") or "unknown",
+                    "saved_as":          None,  # set once the user clicks Save
                     "df_sched":    df_sched,
                     "df_bookings": df_bookings,
                 }
@@ -839,6 +946,7 @@ with tab_optimize:
                     "and more efficient; consider re-running once the issue is resolved."
                 )
             st.success(f"Schedule generated using the **{sr['engine']}** engine.")
+            st.caption(f"Generated by **{sr['generated_by']}** on **{sr['generated_at']}**")
 
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Pax Served",           f"{sr['served_pax']} / {sr['total_pax']}")
@@ -852,13 +960,49 @@ with tab_optimize:
             )
             c5.metric("Avg Load Factor", f"{sr.get('avg_load_factor', 0):.0f}%")
 
-            if sr["dropped_items"]:
+            _diagnoses = sr.get("dropped_diagnoses") or []
+            if _diagnoses:
+                _infeasible  = [x for x in _diagnoses if x["category"] == "infeasible"]
+                _no_aircraft = [x for x in _diagnoses if x["category"] in ("no_free_aircraft", "no_aircraft")]
                 st.warning(
-                    f"{sr['dropped_pax']} pax on {len(sr['dropped_items'])} booking(s) "
-                    "could not be served — check capacity, daylight windows, or duty limits."
+                    f"{sr['dropped_pax']} pax on {len(_diagnoses)} booking(s) could not be "
+                    f"served — {sum(x['pax'] for x in _infeasible)} pax cannot be flown under "
+                    f"current constraints, {sum(x['pax'] for x in _no_aircraft)} pax were flyable "
+                    f"but no aircraft was free. See the detailed report below."
                 )
-                for msg in sr["dropped_items"]:
-                    st.write(f"  • {msg}")
+                with st.expander(
+                    f"📋 Unserved-passenger report ({len(_diagnoses)} bookings) — for ops review",
+                    expanded=True,
+                ):
+                    st.markdown(
+                        "**Hard constraint** — not flyable by any eligible aircraft as currently "
+                        "configured (schedule window, capacity, daylight, or duty limit). Fix by "
+                        "loosening the constraint or the published schedule window."
+                    )
+                    _df_infeasible = pd.DataFrame([
+                        {"Booking ID": x["demand_id"], "From→To": f"{x['origin']}→{x['dest']}",
+                         "Pax": x["pax"], "Flight": x["flight_tag"] or "", "Reason": x["detail"]}
+                        for x in _infeasible
+                    ])
+                    if not _df_infeasible.empty:
+                        st.dataframe(_df_infeasible, width='stretch', hide_index=True)
+                    else:
+                        st.caption("None.")
+
+                    st.markdown(
+                        "**Fleet-size limit** — physically flyable on schedule, but every "
+                        "eligible aircraft was already committed to other passengers. Fix by "
+                        "adding another aircraft to the flight, or freeing one up."
+                    )
+                    _df_no_ac = pd.DataFrame([
+                        {"Booking ID": x["demand_id"], "From→To": f"{x['origin']}→{x['dest']}",
+                         "Pax": x["pax"], "Flight": x["flight_tag"] or "", "Detail": x["detail"]}
+                        for x in _no_aircraft
+                    ])
+                    if not _df_no_ac.empty:
+                        st.dataframe(_df_no_ac, width='stretch', hide_index=True)
+                    else:
+                        st.caption("None.")
 
             t1, t2 = st.tabs(["Flight Schedule", "Bookings"])
             with t1:
@@ -867,7 +1011,7 @@ with tab_optimize:
                 st.dataframe(sr["df_bookings"], width='stretch', hide_index=True)
 
             st.divider()
-            dl1, dl2, dl3 = st.columns([2, 2, 1])
+            dl1, dl2, dl3, dl4 = st.columns([2, 2, 2, 1])
             dl1.download_button(
                 "⬇ Download schedule.csv",
                 sr["df_sched"].to_csv(index=False).encode(),
@@ -883,6 +1027,27 @@ with tab_optimize:
                 key="dl_bookings",
             )
             with dl3:
+                if sr.get("saved_as"):
+                    st.success(f"Saved as {sr['saved_as']}")
+                elif st.button("💾 Save this schedule", key="btn_save_sched"):
+                    _fname = ingest.save_schedule(
+                        manifest_date=sr["manifest_date"],
+                        generated_by=sr["generated_by"],
+                        generated_at=sr["generated_at"],
+                        engine=sr["engine"],
+                        summary={
+                            "served_pax": sr["served_pax"], "total_pax": sr["total_pax"],
+                            "ac_used": sr["ac_used"], "total_block": sr["total_block"],
+                            "empty_block": sr["empty_block"], "avg_load_factor": sr["avg_load_factor"],
+                            "dropped_pax": sr["dropped_pax"],
+                        },
+                        schedule_rows=sr["df_sched"].to_dict("records"),
+                        booking_rows=sr["df_bookings"].to_dict("records"),
+                        dropped_diagnoses=_diagnoses,
+                    )
+                    sr["saved_as"] = _fname
+                    st.rerun()
+            with dl4:
                 if st.button("🗑 Clear", key="btn_clear_sched",
                              help="Remove results to start a fresh run"):
                     st.session_state["sched_result"] = None
@@ -1082,3 +1247,106 @@ with tab_routes:
             width='stretch',
             hide_index=True,
         )
+
+
+# =========================================================================== #
+# TAB — Saved Schedules
+# =========================================================================== #
+
+with tab_saved:
+    st.subheader("Saved Schedules")
+    st.caption(
+        "Schedules are only saved when someone clicks **Save this schedule** in the "
+        "Run Optimizer tab — nothing here happens automatically."
+    )
+
+    _saved_list = ingest.list_saved_schedules()
+    if not _saved_list:
+        st.info("No schedules have been saved yet.")
+    else:
+        for _entry in _saved_list:
+            _summary = _entry.get("summary", {})
+            _label = (
+                f"{_entry['manifest_date']} — generated by {_entry['generated_by']} "
+                f"on {_entry['generated_at']} ({_entry['engine']}) — "
+                f"{_summary.get('served_pax', '?')}/{_summary.get('total_pax', '?')} pax served"
+            )
+            with st.expander(_label):
+                _data = ingest.load_saved_schedule(_entry["file"])
+                if _data is None:
+                    st.error("Could not load this saved schedule (file missing).")
+                    continue
+
+                sc1, sc2, sc3, sc4 = st.columns(4)
+                sc1.metric("Pax Served", f"{_summary.get('served_pax','?')} / {_summary.get('total_pax','?')}")
+                sc2.metric("Aircraft Used", _summary.get("ac_used", "?"))
+                sc3.metric("Total Block", f"{_summary.get('total_block','?')} min")
+                sc4.metric("Avg Load Factor", f"{_summary.get('avg_load_factor', 0):.0f}%")
+
+                _diag = _data.get("dropped_diagnoses") or []
+                if _diag:
+                    st.warning(f"{_summary.get('dropped_pax', 0)} pax on {len(_diag)} booking(s) were unserved.")
+                    st.dataframe(
+                        pd.DataFrame([
+                            {"Booking ID": x["demand_id"], "From→To": f"{x['origin']}→{x['dest']}",
+                             "Pax": x["pax"], "Category": x["category"], "Detail": x["detail"]}
+                            for x in _diag
+                        ]),
+                        width='stretch', hide_index=True,
+                    )
+
+                _vt1, _vt2 = st.tabs(["Flight Schedule", "Bookings"])
+                _df_sched_v   = pd.DataFrame(_data.get("schedule_rows") or [])
+                _df_bookings_v = pd.DataFrame(_data.get("booking_rows") or [])
+                with _vt1:
+                    st.dataframe(_df_sched_v, width='stretch', hide_index=True)
+                with _vt2:
+                    st.dataframe(_df_bookings_v, width='stretch', hide_index=True)
+
+                _bcol1, _bcol2, _bcol3 = st.columns([2, 2, 1])
+                _bcol1.download_button(
+                    "⬇ Download schedule.csv", _df_sched_v.to_csv(index=False).encode(),
+                    file_name=f"schedule_{_entry['manifest_date']}.csv", mime="text/csv",
+                    key=f"dl_sched_{_entry['file']}",
+                )
+                _bcol2.download_button(
+                    "⬇ Download bookings.csv", _df_bookings_v.to_csv(index=False).encode(),
+                    file_name=f"bookings_{_entry['manifest_date']}.csv", mime="text/csv",
+                    key=f"dl_bookings_{_entry['file']}",
+                )
+                if _is_admin:
+                    if _bcol3.button("🗑 Delete", key=f"del_sched_{_entry['file']}"):
+                        ingest.delete_saved_schedule(_entry["file"])
+                        st.rerun()
+
+
+# =========================================================================== #
+# TAB — Admin (only visible to admin users)
+# =========================================================================== #
+
+if tab_admin is not None:
+    with tab_admin:
+        st.subheader("User Management")
+        st.caption("Only admins can see this tab and create new accounts.")
+
+        st.markdown("**Existing users**")
+        st.dataframe(pd.DataFrame(auth.list_users()), width='stretch', hide_index=True)
+
+        st.divider()
+        st.markdown("**Create a new user**")
+        with st.form("create_user_form"):
+            _new_email = st.text_input("Email")
+            _new_role = st.selectbox("Role", auth.ROLES, help="admin = can create users; ops = normal access")
+            _new_pw1 = st.text_input("Password", type="password", help="At least 8 characters")
+            _new_pw2 = st.text_input("Confirm password", type="password")
+            _create_submit = st.form_submit_button("Create user", type="primary")
+        if _create_submit:
+            if _new_pw1 != _new_pw2:
+                st.error("Passwords do not match.")
+            else:
+                try:
+                    auth.create_user(_new_email, _new_pw1, _new_role, created_by=_me["username"])
+                    st.success(f"Created user {_new_email.strip().lower()} ({_new_role}).")
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))

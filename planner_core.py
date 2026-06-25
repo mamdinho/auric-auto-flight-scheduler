@@ -494,6 +494,85 @@ def plan_cost(route_results: dict[str, RouteResult], dropped_pax: int, w: Weight
 
 
 # --------------------------------------------------------------------------- #
+# UNSERVED-PAX DIAGNOSTICS  --  tells ops WHY a booking was dropped, in terms
+# they can act on, instead of just listing it.
+# --------------------------------------------------------------------------- #
+@dataclass
+class DropDiagnosis:
+    demand_id: str
+    origin: str
+    dest: str
+    pax: int
+    flight_tag: str | None
+    category: str   # "infeasible" | "no_free_aircraft" | "no_aircraft"
+    detail: str      # human-readable explanation
+
+
+def diagnose_dropped_demands(
+    dropped: list[Demand],
+    fleet: list[Aircraft],
+    strips: dict[str, Airstrip],
+    lm: LoadModel,
+) -> list[DropDiagnosis]:
+    """For every booking the optimizer could not serve, work out WHY in terms
+    ops can act on: either no aircraft could PHYSICALLY fly it on time or
+    within capacity (a hard constraint -- loosen the schedule window or the
+    constraint itself to fix), or it COULD have been flown but every eligible
+    aircraft was already committed elsewhere (a fleet-size limit -- add an
+    aircraft, or free one up, to fix).
+
+    Tested by giving each eligible aircraft a FRESH, otherwise-empty route
+    carrying ONLY this one booking -- this isolates the booking from whatever
+    else happened to be competing for capacity in the actual solve, so the
+    distinction above is unambiguous.
+    """
+    out: list[DropDiagnosis] = []
+    for d in dropped:
+        if d.flight_tag is None:
+            eligible = fleet
+        else:
+            eligible = [
+                ac for ac in fleet
+                if ac.flight_tag is None
+                or ac.flight_tag == d.flight_tag
+                or ac.next_route == d.flight_tag
+            ]
+        if not eligible:
+            out.append(DropDiagnosis(
+                d.id, d.origin, d.dest, d.pax, d.flight_tag, "no_aircraft",
+                f"No aircraft is assigned to flight {d.flight_tag!r} (or set to "
+                f"continue to it) that could carry this booking at all.",
+            ))
+            continue
+
+        best_reason = None
+        feasible_ac = None
+        for ac in eligible:
+            stops = [Stop(ac.base, "start"), Stop(d.origin, "pickup", d.id),
+                     Stop(d.dest, "delivery", d.id), Stop(ac.base, "end")]
+            r = evaluate_route(ac, stops, strips, {d.id: d}, lm)
+            if r.feasible:
+                feasible_ac = ac
+                break
+            best_reason = r.reason
+
+        if feasible_ac is not None:
+            out.append(DropDiagnosis(
+                d.id, d.origin, d.dest, d.pax, d.flight_tag, "no_free_aircraft",
+                f"Flyable on a {feasible_ac.type} ({feasible_ac.reg}) -- every "
+                f"eligible aircraft was already committed to other passengers "
+                f"by the time this booking needed service. Adding another "
+                f"aircraft, or freeing one up, would let it be served.",
+            ))
+        else:
+            out.append(DropDiagnosis(
+                d.id, d.origin, d.dest, d.pax, d.flight_tag, "infeasible",
+                best_reason or "No eligible aircraft can serve this booking under current constraints.",
+            ))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # PRETTY PRINTING
 # --------------------------------------------------------------------------- #
 def hhmm(m: float) -> str:

@@ -19,6 +19,12 @@ data/manifest.csv
 # Per-day aircraft assignments — operational data, not source code.
 data/flight_aircraft/
 
+# User accounts (password hashes + salts) — never commit, even hashed.
+data/users.json
+
+# Saved generated schedules — operational output, not source code.
+data/saved_schedules/
+
 # ── OS noise ──────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
