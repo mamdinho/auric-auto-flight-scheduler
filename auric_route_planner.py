@@ -147,19 +147,23 @@ def build_and_solve(strips, fleet, manifest, w: pc.Weights, lm: pc.LoadModel,
             lo = max(lo, demands[did].earliest_dep)
         time_dim.CumulVar(idx).SetRange(lo, hi)
         if kind == "delivery" and demands[did].connect_by is not None:
-            # evaluate_route enforces this window as HARD after extraction
-            # (see strip_time_window_demands) — a route that is even one
-            # minute late gets that demand stripped out entirely, same net
-            # effect as never having served it.  The soft bound here should
-            # discourage lateness WITHOUT creating a cost cliff so steep that
-            # cheapest-insertion and local search treat "slightly late" as
-            # catastrophically as "infeasible" and avoid that region of the
-            # search space altogether -- ramp up to the drop-equivalent cost
-            # over ~10 minutes late (matching the schedule tolerance already
-            # built into the window) rather than reaching it after 1 minute.
-            late_penalty_per_min = max(1, int(w.w_drop * demands[did].pax * SCALE / 10))
+            # evaluate_route enforces this window as HARD after extraction (see
+            # strip_time_window_demands), so this soft bound only needs to
+            # nudge the search away from lateness, not replicate the hard cut.
+            # MEASURED on the real solver (not just reasoned about): scaling
+            # this by w_drop * pax — even divided down to 1/10th — consistently
+            # made OR-Tools perform WORSE than the plain heuristic fallback
+            # (served pax dropped from ~106 to ~89 across repeated trials on
+            # the same manifest). A pax-scaled penalty creates a cost cliff
+            # that PARALLEL_CHEAPEST_INSERTION and GUIDED_LOCAL_SEARCH can't
+            # navigate smoothly — large-pax demands get treated as too risky
+            # to insert anywhere near the boundary, even at an on-time position.
+            # The plain flat w_connection rate, swept against the same manifest,
+            # was stable at 101-106 pax served across every metaheuristic and
+            # time-budget combination tried. Do not re-introduce pax scaling
+            # here without re-measuring on a real OR-Tools run.
             time_dim.SetCumulVarSoftUpperBound(
-                idx, max(demands[did].connect_by), late_penalty_per_min)
+                idx, max(demands[did].connect_by), int(w.w_connection * SCALE))
 
     # ---- PICKUP & DELIVERY pairing: same vehicle, pickup before delivery ----
     solver = routing.solver()
