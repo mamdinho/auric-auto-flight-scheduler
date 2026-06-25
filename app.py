@@ -190,49 +190,72 @@ with st.sidebar:
     st.header("How to use this app")
     st.markdown(
         """
-There are tabs at the top of the page for each part of the daily workflow:
+You're signed in — every tab below is part of the daily workflow.
 
 ---
 
-### Tab 1 — Build Manifest *(daily)*
+### 📋 Build Manifest *(daily)*
 Turn today's ops documents into an optimiser-ready manifest.
 
 1. **Upload Booking Analysis CSV** (once per day, optional — used to cross-check totals)
 2. **Select a flight** from the dropdown (routes are pre-configured in Manage Routes)
-3. **Upload the passenger list PDF** for that flight
-4. Click **Add Flight to Manifest** — the O-D demand rows appear below
-5. Repeat steps 2-4 for every flight operating today
-6. Click **→ Run Optimizer** when all flights are added
+3. **Set the aircraft available today** for that flight: how many, type
+   (Caravan / Pilatus / Dash-8), and per-aircraft options:
+   - **Return to Base** — uncheck if it should stay at its last stop
+     instead of flying back
+   - **Continue to Route** — pick another flight for it to serve once
+     it's done with this one (only that aircraft gets both flights' work;
+     all others stay restricted to their own flight)
+4. **Upload the passenger list PDF** for that flight
+5. Click **Add Flight to Manifest** — the O-D demand rows appear below
+   (re-uploading the same flight replaces its rows, no double-counting)
+6. Repeat steps 2-5 for every flight operating today
+7. Click **→ Run Optimizer** when all flights are added
+
+Saved passenger-list PDFs can be re-downloaded or deleted further down
+this tab.
 
 ---
 
-### Tab 2 — Run Optimizer *(daily)*
-- Uses the manifest built in Tab 1, or upload your own `manifest.csv`
-- Click **Generate Schedule** to run OR-Tools (or heuristic fallback)
-- Any unserved pax get a detailed report explaining exactly why — hard
-  constraint vs. no aircraft was free — so ops knows what to fix
-- Click **Save this schedule** to keep a permanent record (who generated it
-  and when), retrievable later from the **Saved Schedules** tab
+### ✈ Run Optimizer *(daily)*
+- Uses the manifest built in Build Manifest, or upload your own `manifest.csv`
+- Pick an **Optimization effort** (Auto/Fast/Thorough) — more time lets
+  OR-Tools search a larger solution space for a shorter, more efficient plan
+- Click **Generate Schedule** to run OR-Tools (falls back to a heuristic if
+  OR-Tools is unavailable — you'll be told explicitly if that happens)
+- Arrivals are held to **±10 minutes** of the published schedule automatically
+- Any unserved pax get a **detailed report** split into two groups:
+  - *Hard constraint* — not flyable at all under current rules (fix by
+    loosening a schedule window or constraint)
+  - *Fleet-size limit* — flyable, but every eligible aircraft was already
+    committed elsewhere (fix by adding or freeing up an aircraft)
+- Click **💾 Save this schedule** to keep a permanent record — who generated
+  it and when — retrievable later from **Saved Schedules**
 - Download `schedule.csv` and `bookings.csv`
 
 ---
 
-### Tab — Saved Schedules
-Browse every schedule anyone has saved: who generated it, when, and the
-full detail behind it — including the unserved-pax report.
+### 📂 Saved Schedules
+Browse every schedule anyone has saved: generated-by, generated-on, full
+flight schedule and bookings, and the unserved-pax report. Admins can
+delete old ones.
 
 ---
 
-### Tab — Manage Routes *(one-time setup per flight)*
+### 🗺 Manage Routes *(one-time setup per flight)*
 - Select an existing flight number or type a new one
-- Enter the stop sequence and published leg times (dep/arr HH:MM)
-- Click **Save Route** — the flight is now available in Tab 1
+- Enter the stop sequence and published leg times (dep/arr HH:MM) —
+  these drive both the ±10-minute schedule windows and the aircraft's
+  default type/capacity
+- Click **Save Route** — the flight is now available in Build Manifest
 
 ---
 
-### Tab — Admin *(admin accounts only)*
-- Create new user accounts (admin or ops role)
+### 👤 Admin *(only visible to admin accounts)*
+- Create new user accounts (`admin` can manage users; `ops` is normal access)
 - View everyone who has an account and when it was created
+
+Change your own password any time from the box at the top of this sidebar.
 
 ---
 
@@ -243,7 +266,7 @@ full detail behind it — including the unserved-pax report.
 | `open_min` | Minutes from midnight when the strip opens (390 = 06:30) |
 | `close_min` | Minutes from midnight when the strip closes (1110 = 18:30) |
 | `daylight_only` | 1 = bush strip, no night ops; 0 = lit runway, 24 hr |
-| `connect_by` | Arrival deadline(s) in minutes from midnight, semicolon-separated |
+| `connect_by` | Arrival deadline, minutes from midnight — auto-set to published arrival + 10 min |
 | `earliest_dep` | Earliest departure from origin stop (set from leg timings) |
 | `Positioning` | Empty ferry leg — counts as wasted block time |
 
@@ -252,9 +275,13 @@ Paved airports (ARK, JRO, DAR, ZNZ, MWZ) operate 24 hr (0 → 1440).
 
 ---
 ### Tips
-- **OR-Tools** gives better plans; the heuristic is a fast fallback.
-- If pax show as *UNSERVED*, check seat/payload capacity, daylight
-  windows, or duty limits in `fleet.csv`.
+- **OR-Tools** gives better plans; the heuristic is a fast fallback used only
+  if OR-Tools errors or is unavailable — you'll see a warning when that happens.
+- An aircraft only serves demands from the flight it's assigned to, unless
+  you set **Continue to Route** for it.
+- If pax show as unserved, read the detailed report on the Run Optimizer
+  tab first — it tells you whether it's a hard constraint or just a
+  fleet-size limit, and what to do about it.
 - New airstrip codes must be added to `data/airstrips.csv`.
         """
     )
