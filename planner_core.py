@@ -398,8 +398,16 @@ def evaluate_route(ac: Aircraft, stops: list[Stop],
                     )
                     return res
 
-        # depart after ground time (no turnaround at the closing depot leg)
-        turn = 0 if st.kind == "end" else ac.turnaround_min
+        # Ground time is charged once per AIRSTRIP VISIT, not once per stop:
+        # several demands sharing the same origin/destination board or
+        # deplane together in a single ground event. Only charge turnaround
+        # when the aircraft is actually about to depart this airstrip (the
+        # next stop is a different code, or there is no next stop / it's the
+        # closing depot leg) — otherwise consecutive same-code stops would
+        # each add a full turnaround and silently eat into the duty/time-window
+        # budget for no physical reason.
+        same_as_next = idx + 1 < len(stops) and stops[idx + 1].code == st.code
+        turn = 0 if (st.kind == "end" or same_as_next) else ac.turnaround_min
         t = service_start + turn
         prev = cur
 

@@ -113,7 +113,13 @@ def build_and_solve(strips, fleet, manifest, w: pc.Weights, lm: pc.LoadModel,
         fn = manager.IndexToNode(from_index)
         a = strips[code_of(fn)]; b = strips[code_of(manager.IndexToNode(to_index))]
         t = pc.block_minutes(a, b, rep_speed, lm)
-        if nodes[fn][1] != "depot":
+        # Only charge ground turnaround when actually departing this airstrip.
+        # Several demands sharing one origin/destination board or deplane in a
+        # single ground event, not one full turnaround each (mirrors the same
+        # fix in evaluate_route) — without this, a==b (same-code) transitions
+        # between co-located pickups/deliveries would each tack on a needless
+        # turnaround and starve the route of time it should have available.
+        if nodes[fn][1] != "depot" and a.code != b.code:
             t += turn
         return int(round(t))
     time_idx = routing.RegisterTransitCallback(time_cb)

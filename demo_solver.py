@@ -137,23 +137,29 @@ def solve(strips, fleet, demand_list, w: pc.Weights, lm: pc.LoadModel):
                     if ra is None or rb is None or ra == rb:
                         continue
                     before = total_cost()
-                    saved_a, saved_b = routes[ra], routes[rb]
-                    routes[ra] = [s for s in saved_a if s.demand_id != da.id]
-                    routes[rb] = [s for s in saved_b if s.demand_id != db.id]
+                    # Snapshot EVERY route, not just ra/rb: best_insertion is free to
+                    # place da/db into a third route entirely, and a partial revert
+                    # (only ra/rb) would leave a stray duplicate copy behind in
+                    # whichever route it actually landed in.
+                    snapshot = {reg: stops[:] for reg, stops in routes.items()}
+                    routes[ra] = [s for s in routes[ra] if s.demand_id != da.id]
+                    routes[rb] = [s for s in routes[rb] if s.demand_id != db.id]
                     ins_a = best_insertion(da)
-                    ins_b = best_insertion(db)
-                    if ins_a is None or ins_b is None:
-                        routes[ra], routes[rb] = saved_a, saved_b
+                    if ins_a is None:
+                        routes.update(snapshot)
                         continue
                     _, reg_a, stops_a = ins_a
                     routes[reg_a] = stops_a
+                    ins_b = best_insertion(db)
+                    if ins_b is None:
+                        routes.update(snapshot)
+                        continue
                     _, reg_b, stops_b = ins_b
                     routes[reg_b] = stops_b
                     if total_cost() < before - 1e-6:
                         swapped_any = True
                     else:
-                        routes[ra] = saved_a
-                        routes[rb] = saved_b
+                        routes.update(snapshot)
             if not swapped_any:
                 break
 
