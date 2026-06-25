@@ -32,10 +32,37 @@ import ingest
 # Helpers
 # --------------------------------------------------------------------------- #
 
-def _split_large_demands(manifest: list, max_seats: int) -> list:
-    """Split any demand with pax > max_seats into sub-demands that each fit."""
+def _split_large_demands(manifest: list, fleet: list) -> list:
+    """Split any demand with pax exceeding the largest aircraft ELIGIBLE to
+    serve it into sub-demands that each fit.
+
+    The seat cap must be computed per-demand, not globally across the whole
+    day's fleet: a demand tagged for a flight whose own aircraft are all
+    12-seat Caravans can never be served by a 50-seat Dash-8 sitting in a
+    DIFFERENT flight's assignment (flight-tag ownership forbids it), so using
+    the day-wide max seat count would leave it unsplit and permanently
+    unservable regardless of how good the optimizer is.
+    """
+    def _eligible_max_seats(d) -> int:
+        # Mirror evaluate_route's restriction exactly: a demand with no
+        # flight_tag (e.g. a manually uploaded manifest.csv) is unrestricted,
+        # so every aircraft is eligible -- do NOT fall through to the
+        # next_route comparison below, where None == None would wrongly
+        # match every aircraft that simply has no next_route set.
+        if d.flight_tag is None:
+            eligible = [ac.seats for ac in fleet]
+        else:
+            eligible = [
+                ac.seats for ac in fleet
+                if ac.flight_tag is None
+                or ac.flight_tag == d.flight_tag
+                or ac.next_route == d.flight_tag
+            ]
+        return max(eligible) if eligible else 12
+
     result = []
     for d in manifest:
+        max_seats = _eligible_max_seats(d)
         if d.pax <= max_seats:
             result.append(d)
             continue
@@ -676,9 +703,9 @@ with tab_optimize:
                     pass
 
             if _load_ok:
-                # Split demands that exceed the largest aircraft's seat count
-                _max_seats = max(ac.seats for ac in fleet) if fleet else 12
-                manifest   = _split_large_demands(manifest, _max_seats)
+                # Split demands that exceed the largest aircraft ELIGIBLE to serve
+                # them (per flight-tag ownership), not the day-wide fleet max.
+                manifest = _split_large_demands(manifest, fleet)
                 demands = {d.id: d for d in manifest}
                 w, lm   = pc.Weights(), pc.LoadModel()
 
