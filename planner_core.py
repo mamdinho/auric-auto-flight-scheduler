@@ -25,6 +25,17 @@ import csv
 import os
 
 # --------------------------------------------------------------------------- #
+# SCHEDULE WINDOW GRACE  --  connect_by (set in ingest.build_manifest as
+# published arrival + 10 min) is the primary window. A delivery landing within
+# this many EXTRA minutes past that is still accepted -- the receiving flight
+# "waits" for the connecting passenger -- but anything later than that is a
+# hard drop. Two tiers, not one: connect_by's own +10 covers normal schedule
+# slack; this covers the "nearly missed it" case ops can still salvage.
+# --------------------------------------------------------------------------- #
+CONNECT_BY_GRACE_MIN = 10
+
+
+# --------------------------------------------------------------------------- #
 # OBJECTIVE WEIGHTS  --  this is the P&L dial. Tuning these is a business
 # decision you own, not a technical one. Raise W_EMPTY if empty legs are
 # killing margin; raise W_CONNECTION if missed connections cost you guests.
@@ -385,18 +396,29 @@ def evaluate_route(ac: Aircraft, stops: list[Stop],
             d = demands[st.demand_id]
             onboard_pax -= d.pax
             onboard_kg -= d.weight_kg(lm)
-            # connect_by is a HARD schedule-window constraint (±10 min of published arrival)
+            # connect_by is a HARD schedule-window constraint (already includes
+            # the published-arrival +10 min). A SECOND, smaller grace period
+            # beyond that is still accepted -- the connection "waits" for a
+            # nearly-on-time passenger -- but anything later than the combined
+            # cutoff is dropped; there's no saving a connection that's missed
+            # by more than that.
             if d.connect_by is not None:
                 last_conn = max(d.connect_by)
-                if service_start > last_conn + 1e-6:
+                hard_cutoff = last_conn + CONNECT_BY_GRACE_MIN
+                if service_start > hard_cutoff + 1e-6:
                     res.feasible = False
                     _t = int(service_start)
                     res.reason = (
                         f"late delivery at {cur.code}: "
                         f"arrive {_t//60:02d}:{_t%60:02d} > "
-                        f"window {last_conn//60:02d}:{last_conn%60:02d}"
+                        f"window {last_conn//60:02d}:{last_conn%60:02d} "
+                        f"(+{CONNECT_BY_GRACE_MIN}min grace = {hard_cutoff//60:02d}:{hard_cutoff%60:02d})"
                     )
                     return res
+                if service_start > last_conn + 1e-6:
+                    # within the grace window: accept it, but track how long
+                    # the connection had to wait for reporting/cost purposes
+                    res.connection_late_min += (service_start - last_conn)
 
         # Ground time is charged once per AIRSTRIP VISIT, not once per stop:
         # several demands sharing the same origin/destination board or

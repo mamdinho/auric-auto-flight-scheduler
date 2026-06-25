@@ -176,8 +176,16 @@ def build_and_solve(strips, fleet, manifest, w: pc.Weights, lm: pc.LoadModel,
             # was stable at 101-106 pax served across every metaheuristic and
             # time-budget combination tried. Do not re-introduce pax scaling
             # here without re-measuring on a real OR-Tools run.
+            #
+            # The bound itself is connect_by + the extra grace period (see
+            # planner_core.CONNECT_BY_GRACE_MIN) so this soft penalty doesn't
+            # kick in until evaluate_route's hard cutoff actually would --
+            # otherwise OR-Tools would treat the grace window as costly when
+            # it's actually fine, biasing the search away from solutions the
+            # hard check downstream would accept.
             time_dim.SetCumulVarSoftUpperBound(
-                idx, max(demands[did].connect_by), int(w.w_connection * SCALE))
+                idx, max(demands[did].connect_by) + pc.CONNECT_BY_GRACE_MIN,
+                int(w.w_connection * SCALE))
 
     # ---- PICKUP & DELIVERY pairing: same vehicle, pickup before delivery ----
     solver = routing.solver()
