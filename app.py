@@ -28,6 +28,7 @@ if here not in sys.path:
 import planner_core as pc
 import ingest
 import auth
+import storage_paths
 
 
 # --------------------------------------------------------------------------- #
@@ -614,7 +615,7 @@ with tab_build:
                 )
 
                 # Save PDF to disk so it stays accessible for the day
-                _plist_dir = os.path.join(here, "data", "passenger_lists")
+                _plist_dir = os.path.join(storage_paths.DATA_DIR, "passenger_lists")
                 os.makedirs(_plist_dir, exist_ok=True)
                 _safe_date = (day or "unknown").replace("/", "-").replace("\\", "-")
                 _fn_key    = (flight_num or selected_flight).replace("/", "-")
@@ -686,7 +687,7 @@ with tab_build:
     # ------------------------------------------------------------------ #
     st.divider()
     st.subheader("Saved Passenger Lists")
-    _plist_dir = os.path.join(here, "data", "passenger_lists")
+    _plist_dir = os.path.join(storage_paths.DATA_DIR, "passenger_lists")
     _saved = sorted(
         [f for f in os.listdir(_plist_dir) if f.endswith(".pdf")]
     ) if os.path.exists(_plist_dir) else []

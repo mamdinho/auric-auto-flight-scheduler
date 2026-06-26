@@ -15,8 +15,9 @@ import os
 import secrets
 from datetime import datetime
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-USERS_PATH = os.path.join(_HERE, "data", "users.json")
+import storage_paths
+
+USERS_PATH = os.path.join(storage_paths.DATA_DIR, "users.json")
 
 PBKDF2_ITERATIONS = 260_000
 ROLES = ("admin", "ops")

@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: auric-air-scheduler
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: AURIC_DATA_DIR
+        value: /var/data
+      - key: AURIC_BOOTSTRAP_PW
+        sync: false
+    disk:
+      name: auric-data
+      mountPath: /var/data
+      sizeGB: 1

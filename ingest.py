@@ -16,10 +16,16 @@ import re
 from datetime import datetime
 import pandas as pd
 
+import storage_paths
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
-ROUTES_CSV = os.path.join(_HERE, "data", "flight_routes.csv")
-FLIGHT_AIRCRAFT_DIR = os.path.join(_HERE, "data", "flight_aircraft")
-SAVED_SCHEDULES_DIR = os.path.join(_HERE, "data", "saved_schedules")
+# flight_routes.csv is ops-mutable at runtime (Manage Routes tab), so it lives
+# on the persistent data dir, seeded from the repo's checked-in copy on first
+# boot. flight_aircraft/ and saved_schedules/ are pure runtime output -- no
+# seed needed, just the right directory.
+ROUTES_CSV = storage_paths.seed_if_missing("flight_routes.csv")
+FLIGHT_AIRCRAFT_DIR = os.path.join(storage_paths.DATA_DIR, "flight_aircraft")
+SAVED_SCHEDULES_DIR = os.path.join(storage_paths.DATA_DIR, "saved_schedules")
 
 # Airstrip code aliases — maps names used in passenger PDFs to the internal
 # code used in airstrips.csv and flight_routes.csv.
